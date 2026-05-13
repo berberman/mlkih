@@ -1,0 +1,86 @@
+cabal-version:   3.0
+name:            mlkih
+version:         0.0.0
+synopsis:        My Lean Kernel in Haskell
+license:         MIT
+license-file:    LICENSE
+author:          Potato Hatsue
+maintainer:      berberman@yandex.com
+copyright:       Copyright (c) 2026 Potato Hatsue
+category:        Language
+build-type:      Simple
+extra-doc-files: CHANGELOG.md
+data-files:      test/fixtures/export/*.ndjson
+
+common warnings
+  ghc-options:
+    -Wall -Wcompat -Widentities -Wincomplete-uni-patterns
+    -Wincomplete-record-updates -Wredundant-constraints
+    -fhide-source-paths -Wno-name-shadowing
+    -Wno-unticked-promoted-constructors
+
+  build-depends:
+    , aeson
+    , base                  ^>=4.20
+    , bytestring
+    , containers
+    , mtl
+    , text
+    , unordered-containers
+
+library
+  import:           warnings
+  exposed-modules:
+    Mlkih
+    Mlkih.AST
+    Mlkih.Decl
+    Mlkih.Env
+    Mlkih.Export
+    Mlkih.Expr
+    Mlkih.Intern
+    Mlkih.Kernel
+    Mlkih.Kernel.Monad
+    Mlkih.Kernel.Semantic
+    Mlkih.Level
+    Mlkih.Name
+    Mlkih.Pretty
+    Mlkih.Types
+
+  other-modules:    Mlkih.UnionFind
+  build-depends:
+    , aeson
+    , base                  ^>=4.20
+    , bytestring
+    , containers
+    , hashable
+    , pretty
+    , scientific
+    , text
+    , unordered-containers
+    , vector
+
+  hs-source-dirs:   src
+  default-language: Haskell2010
+
+executable mlkih
+  import:           warnings
+  main-is:          Main.hs
+  build-depends:    mlkih
+  hs-source-dirs:   app
+  default-language: Haskell2010
+
+test-suite mlkih-test
+  import:           warnings
+  default-language: Haskell2010
+  type:             exitcode-stdio-1.0
+  autogen-modules:  Paths_mlkih
+  other-modules:    Paths_mlkih
+  hs-source-dirs:   test
+  main-is:          Main.hs
+  build-depends:
+    , directory
+    , filepath
+    , mlkih
+    , process
+    , tasty
+    , tasty-hunit

@@ -1,0 +1,13 @@
+name = "mlkih-fixtures"
+defaultTargets = ["NatAddSuccFixture", "NatAddAddAddCommFixture"]
+
+[[require]]
+name = "lean4export"
+git = "https://github.com/leanprover/lean4export"
+rev = "v4.30.0-rc2"
+
+[[lean_lib]]
+name = "NatAddSuccFixture"
+
+[[lean_lib]]
+name = "NatAddAddAddCommFixture"
