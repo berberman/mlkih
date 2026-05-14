@@ -39,14 +39,13 @@ library
     Mlkih.Expr
     Mlkih.Intern
     Mlkih.Kernel
-    Mlkih.Kernel.Monad
-    Mlkih.Kernel.Semantic
+    Mlkih.Kernel.Eval
+    Mlkih.Kernel.Types
     Mlkih.Level
     Mlkih.Name
     Mlkih.Pretty
     Mlkih.Types
 
-  other-modules:    Mlkih.UnionFind
   build-depends:
     , aeson
     , base                  ^>=4.20

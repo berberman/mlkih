@@ -56,7 +56,7 @@ data Expr' e l n
   | Lam n e e BinderInfo
   | ForallE n e e BinderInfo
   | Lit Literal
-  | Let n e e e
+  | Let n e e e Bool
   | Proj n Int e
   deriving (Show, Eq, Ord)
 
@@ -87,16 +87,19 @@ instance (PrettyPrint e, PrettyPrint l, PrettyPrint n) => PrettyPrint (Expr' e l
               <+> ppr body
           )
       Lit lit -> ppr lit
-      Let name ty value body ->
+      Let name ty value body nondep ->
         parens
-          ( text "let"
-              <+> ppr name
-              <+> char ':'
-              <+> ppr ty
-              <+> text ":="
-              <+> ppr value
-              <+> text ";"
-              <+> ppr body
+          ( if nondep
+              then text "have"
+              else
+                text "let"
+                  <+> ppr name
+                  <+> char ':'
+                  <+> ppr ty
+                  <+> text ":="
+                  <+> ppr value
+                  <+> text ";"
+                  <+> ppr body
           )
       Proj name idx struct -> ppr name <> char '.' <> int idx <> parens (ppr struct)
     where
@@ -118,7 +121,7 @@ instance (Hashable e, Hashable l, Hashable n) => Hashable (Expr' e l n) where
       Lam name ty body binderInfo -> hashWithSalt (hashWithSalt (hashWithSalt (hashWithSalt salt (5 :: Int)) name) ty) (body, binderInfo)
       ForallE name ty body binderInfo -> hashWithSalt (hashWithSalt (hashWithSalt (hashWithSalt salt (6 :: Int)) name) ty) (body, binderInfo)
       Lit lit -> hashWithSalt (hashWithSalt salt (7 :: Int)) lit
-      Let name ty value body -> hashWithSalt (hashWithSalt (hashWithSalt (hashWithSalt salt (8 :: Int)) name) ty) (value, body)
+      Let name ty value body nondep -> hashWithSalt (hashWithSalt (hashWithSalt (hashWithSalt salt (8 :: Int)) name) ty) (value, body, nondep)
       Proj name idx struct -> hashWithSalt (hashWithSalt (hashWithSalt (hashWithSalt salt (9 :: Int)) name) idx) struct
 
 newtype Expr = Expr {unExpr :: Expr' Expr Level Name}

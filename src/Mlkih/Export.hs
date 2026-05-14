@@ -7,8 +7,6 @@ module Mlkih.Export
     parseExportWithState,
     parseExportFile,
     parseExportFileWithState,
-    checkExport,
-    checkExportFile,
   )
 where
 
@@ -19,7 +17,6 @@ import qualified Data.Aeson.KeyMap as KeyMap
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BSC
-import qualified Data.IntMap as IntMap
 import Data.List (sortOn)
 import Data.Maybe (mapMaybe)
 import Data.Scientific (toBoundedInteger)
@@ -32,7 +29,6 @@ import Mlkih.Decl
 import Mlkih.Env
 import Mlkih.Expr
 import Mlkih.Intern
-import Mlkih.Kernel (checkAndAddDecls)
 import Mlkih.Level
 import Mlkih.Name
 import Mlkih.Types
@@ -74,7 +70,7 @@ data ExprRecord
   | ExprApp Int Int
   | ExprLam Int Int Int BinderInfo
   | ExprForallE Int Int Int BinderInfo
-  | ExprLetE Int Int Int Int
+  | ExprLetE Int Int Int Int Bool
   | ExprProj Int Int Int
   | ExprNatVal Int
   | ExprStrVal Text
@@ -203,22 +199,10 @@ parseExportFileWithState path = withFile path ReadMode loop
                 else case step st (lineNo, line) of
                   Left err -> pure $ Left err
                   Right st' -> do
-                     let sawAnyLine' = True
-                     if lineNo == 1 && not (stMetaSeen st')
-                       then pure $ Left "meta object must be the first record"
-                       else go (lineNo + 1) st' sawAnyLine'
-
-checkExport :: ByteString -> Either String (KernelEnv, InternState)
-checkExport input = do
-  parsed <- parseExportWithState input
-  checkAndAddDecls IntMap.empty (parsedInternState parsed) (parsedDecls parsed)
-
-checkExportFile :: FilePath -> IO (Either String (KernelEnv, InternState))
-checkExportFile path = do
-  parsedResult <- parseExportFileWithState path
-  pure $ do
-    parsed <- parsedResult
-    checkAndAddDecls IntMap.empty (parsedInternState parsed) (parsedDecls parsed)
+                    let sawAnyLine' = True
+                    if lineNo == 1 && not (stMetaSeen st')
+                      then pure $ Left "meta object must be the first record"
+                      else go (lineNo + 1) st' sawAnyLine'
 
 parseLines :: [ByteString] -> Parser ExportState
 parseLines linesToParse = case takeWhile (not . isBlankLine) linesToParse of
@@ -279,7 +263,7 @@ processName lineNo st obj = do
   nameVal <- case record of
     NameStr pre segment -> Str <$> resolveName lineNo st pre <*> pure segment
     NameNum pre n -> Num <$> resolveName lineNo st pre <*> pure n
-  (_, stInternState') <- first (decorate lineNo . (<> "")) $ registerImportedName ident nameVal (stInternState st)
+  (_, stInternState') <- first (decorate lineNo . (<> "")) $ registerImportedNameIn ident nameVal (stInternState st)
   pure st {stInternState = stInternState'}
 
 processLevel :: Int -> ExportState -> Object -> Parser ExportState
@@ -293,7 +277,7 @@ processLevel lineNo st obj = do
     LevelMax lhs rhs -> LMax <$> resolveLevel lineNo st lhs <*> resolveLevel lineNo st rhs
     LevelIMax lhs rhs -> LIMax <$> resolveLevel lineNo st lhs <*> resolveLevel lineNo st rhs
     LevelParam nameId -> LVar <$> resolveName lineNo st nameId
-  (_, stInternState') <- first (decorate lineNo . (<> "")) $ registerImportedLevel ident levelVal (stInternState st)
+  (_, stInternState') <- first (decorate lineNo . (<> "")) $ registerImportedLevelIn ident levelVal (stInternState st)
   pure st {stInternState = stInternState'}
 
 processExpr :: Int -> ExportState -> Object -> Parser ExportState
@@ -309,12 +293,12 @@ processExpr lineNo st obj = do
     ExprApp fnId argId -> App <$> resolveExpr lineNo st fnId <*> resolveExpr lineNo st argId
     ExprLam nameId typeId bodyId binderInfo -> Lam <$> resolveName lineNo st nameId <*> resolveExpr lineNo st typeId <*> resolveExpr lineNo st bodyId <*> pure binderInfo
     ExprForallE nameId typeId bodyId binderInfo -> ForallE <$> resolveName lineNo st nameId <*> resolveExpr lineNo st typeId <*> resolveExpr lineNo st bodyId <*> pure binderInfo
-    ExprLetE nameId typeId valueId bodyId -> Let <$> resolveName lineNo st nameId <*> resolveExpr lineNo st typeId <*> resolveExpr lineNo st valueId <*> resolveExpr lineNo st bodyId
+    ExprLetE nameId typeId valueId bodyId nondep -> Let <$> resolveName lineNo st nameId <*> resolveExpr lineNo st typeId <*> resolveExpr lineNo st valueId <*> resolveExpr lineNo st bodyId <*> pure nondep
     ExprProj typeNameId idx structId -> Proj <$> resolveName lineNo st typeNameId <*> pure idx <*> resolveExpr lineNo st structId
     ExprNatVal n -> pure $ Lit (NatVal n)
     ExprStrVal txt -> pure $ Lit $ StrVal $ Text.unpack txt
     ExprMData exprId -> hceVal <$> resolveExpr lineNo st exprId
-  (_, stInternState') <- first (decorate lineNo . (<> "")) $ registerImportedExpr ident exprVal (stInternState st)
+  (_, stInternState') <- first (decorate lineNo . (<> "")) $ registerImportedExprIn ident exprVal (stInternState st)
   pure st {stInternState = stInternState'}
 
 processDeclarations :: Int -> ExportState -> Object -> Parser ExportState
@@ -402,8 +386,7 @@ parseExprRecord lineNo obj
   | hasKey "letE" obj = do
       payload <- expectObject (fieldContext lineNo "letE") =<< requiredField obj "letE"
       ensureExactObjectFields lineNo "field 'letE' payload" ["name", "type", "value", "body", "nondep"] payload
-      _ <- requiredBool lineNo "nondep" payload
-      ExprLetE <$> requiredIntObj lineNo "letE.name" "name" payload <*> requiredIntObj lineNo "letE.type" "type" payload <*> requiredIntObj lineNo "letE.value" "value" payload <*> requiredIntObj lineNo "letE.body" "body" payload
+      ExprLetE <$> requiredIntObj lineNo "letE.name" "name" payload <*> requiredIntObj lineNo "letE.type" "type" payload <*> requiredIntObj lineNo "letE.value" "value" payload <*> requiredIntObj lineNo "letE.body" "body" payload <*> requiredBool lineNo "nondep" payload
   | hasKey "proj" obj = do
       payload <- expectObject (fieldContext lineNo "proj") =<< requiredField obj "proj"
       ensureExactObjectFields lineNo "field 'proj' payload" ["typeName", "idx", "struct"] payload
@@ -858,17 +841,17 @@ ensureAllowedObjectKeys lineNo label allowedFields obj = do
 
 resolveName :: Int -> ExportState -> HCId -> Either String HCName
 resolveName _ st 0 =
-  maybe (Left "missing anonymous name") Right (lookupNameId 0 (stInternState st))
+  maybe (Left "missing anonymous name") Right (evalIntern (lookupNameId 0) (stInternState st))
 resolveName lineNo st ident =
-  maybe (Left (decorate lineNo ("unknown name id " <> show ident))) Right (lookupNameId ident (stInternState st))
+  maybe (Left (decorate lineNo ("unknown name id " <> show ident))) Right (evalIntern (lookupNameId ident) (stInternState st))
 
 resolveLevel :: Int -> ExportState -> HCId -> Either String HCLevel
 resolveLevel lineNo st ident =
-  maybe (Left (decorate lineNo ("unknown level id " <> show ident))) Right (lookupLevelId ident (stInternState st))
+  maybe (Left (decorate lineNo ("unknown level id " <> show ident))) Right (evalIntern (lookupLevelId ident) (stInternState st))
 
 resolveExpr :: Int -> ExportState -> HCId -> Either String HCExpr
 resolveExpr lineNo st ident =
-  maybe (Left (decorate lineNo ("unknown expr id " <> show ident))) Right (lookupExprId ident (stInternState st))
+  maybe (Left (decorate lineNo ("unknown expr id " <> show ident))) Right (evalIntern (lookupExprId ident) (stInternState st))
 
 context :: Int -> String
 context lineNo = decorate lineNo "record"

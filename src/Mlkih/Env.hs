@@ -22,19 +22,12 @@ data ReducibilityHints
   | Regular Int
   deriving (Show, Eq)
 
-data ReducibilityHintClass
-  = OpaqueHint
-  | AbbrevHint
-  | RegularHint
-  deriving (Show, Eq, Ord)
-
 instance PrettyPrint ReducibilityHints where
   ppr hints =
     case hints of
       Opaque -> text "opaque"
       Abbrev -> text "abbrev"
       Regular n -> text "regular" <+> int n
-
 instance Ord ReducibilityHints where
   compare Abbrev Abbrev = EQ
   compare Abbrev _ = LT
@@ -43,30 +36,6 @@ instance Ord ReducibilityHints where
   compare (Regular _) Opaque = LT
   compare Opaque Opaque = EQ
   compare Opaque _ = GT
-
-reducibilityHintClass :: ReducibilityHints -> ReducibilityHintClass
-reducibilityHintClass hints =
-  case hints of
-    Opaque -> OpaqueHint
-    Abbrev -> AbbrevHint
-    Regular _ -> RegularHint
-
-reducibilityHintRegularHeight :: ReducibilityHints -> Maybe Int
-reducibilityHintRegularHeight hints =
-  case hints of
-    Regular height -> Just height
-    _ -> Nothing
-
-compareReducibilityHintsForDelta :: ReducibilityHints -> ReducibilityHints -> Ordering
-compareReducibilityHintsForDelta lhs rhs =
-  case (lhs, rhs) of
-    (Abbrev, Abbrev) -> EQ
-    (Abbrev, _) -> LT
-    (Regular _, Abbrev) -> GT
-    (Regular lhsHeight, Regular rhsHeight) -> compare rhsHeight lhsHeight
-    (Regular _, Opaque) -> LT
-    (Opaque, Opaque) -> EQ
-    (Opaque, _) -> GT
 
 data DefinitionVal e l = DefinitionVal
   { defConst :: ConstantVal e l,
@@ -149,7 +118,6 @@ data RecursorVal e l = RecursorVal
     -- One constructor, zero constructor arguments, and inductive predicate.
     -- Examples: @Eq@, @Acc@, and @And.intro@
     recKRule :: Bool,
-    -- |
     recRules :: [RecursorRule e l]
   }
   deriving (Show, Eq, Ord)

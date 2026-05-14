@@ -1,14 +1,21 @@
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
+
 module Mlkih.Intern
   ( HasInternState (..),
-    runInternState,
+    withIntern,
+    evalIntern,
     InternState,
     emptyInternState,
     lookupNameId,
     lookupLevelId,
     lookupExprId,
     registerImportedName,
+    registerImportedNameIn,
     registerImportedLevel,
+    registerImportedLevelIn,
     registerImportedExpr,
+    registerImportedExprIn,
     internName,
     internExpr,
     internLevel,
@@ -18,7 +25,7 @@ module Mlkih.Intern
   )
 where
 
-import Control.Monad.State.Strict (MonadState, State, get, put, runState)
+import Control.Monad.State.Strict (MonadState, State, evalState, get, gets, put, runState, state)
 import Data.Hashable (hash)
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
@@ -38,18 +45,26 @@ import Mlkih.Types
 --
 -- Interning never mutates an existing node. If a payload already exists, we
 -- reuse its canonical node; otherwise we allocate a fresh local id.
-type InternM = State InternState
-
 class HasInternState s where
-  getStoredInternState :: s -> InternState
-  setStoredInternState :: InternState -> s -> s
+  getInternState :: s -> InternState
+  setInternState :: InternState -> s -> s
 
-runInternState :: (MonadState s m, HasInternState s) => State InternState a -> m a
-runInternState action = do
+instance HasInternState InternState where
+  getInternState = id
+  setInternState = const
+
+withIntern ::
+  (MonadState s m, HasInternState s) =>
+  (forall n. (MonadState InternState n) => n a) ->
+  m a
+withIntern action = do
   st <- get
-  let (result, internState') = runState action (getStoredInternState st)
-  put (setStoredInternState internState' st)
+  let (result, internState') = runState action (getInternState st)
+  put (setInternState internState' st)
   pure result
+
+evalIntern :: State InternState a -> InternState -> a
+evalIntern action st = evalState action st
 
 data InternState = InternState
   { internNextNameId :: !HCId,
@@ -80,153 +95,83 @@ emptyInternState =
     anonymousName = HCName 0 Anonymous
     zeroLevel = HCLevel 0 LZero
 
-lookupNameId :: HCId -> InternState -> Maybe HCName
-lookupNameId ident st = IntMap.lookup ident $ internNamesById st
+lookupNameId :: (MonadState InternState m) => HCId -> m (Maybe HCName)
+lookupNameId ident = gets $ IntMap.lookup ident . internNamesById
 
-lookupLevelId :: HCId -> InternState -> Maybe HCLevel
-lookupLevelId ident st = IntMap.lookup ident $ internLevelsById st
+lookupLevelId :: (MonadState InternState m) => HCId -> m (Maybe HCLevel)
+lookupLevelId ident = gets $ IntMap.lookup ident . internLevelsById
 
-lookupExprId :: HCId -> InternState -> Maybe HCExpr
-lookupExprId ident st = IntMap.lookup ident $ internExprsById st
+lookupExprId :: (MonadState InternState m) => HCId -> m (Maybe HCExpr)
+lookupExprId ident = gets $ IntMap.lookup ident . internExprsById
 
-registerImportedName :: HCId -> Name' HCName -> InternState -> Either String (HCName, InternState)
-registerImportedName ident val st
-  | ident == 0 =
-      if val == Anonymous
-        then Right (anonymousName, st)
-        else Left "name id 0 is reserved for anonymous"
-  | otherwise =
-      case (IntMap.lookup ident (internNamesById st), lookupNameByVal val st) of
-        (Just existing, _)
-          | hcnVal existing == val -> Right (existing, st)
-          | otherwise -> Left $ "conflicting imported name id " <> show ident
-        (Nothing, Just existingByVal) ->
-          Right
-            ( existingByVal,
-              st
-                { internNamesById = IntMap.insert ident existingByVal $ internNamesById st
-                }
-            )
-        (Nothing, Nothing) ->
-          let node = HCName ident val
-           in Right
-                ( node,
-                  st
-                    { internNamesById = IntMap.insert ident node $ internNamesById st,
-                      internNamesByFingerprint = insertNameFingerprint node $ internNamesByFingerprint st
-                    }
-                )
-  where
-    anonymousName = HCName 0 Anonymous
+registerImportedName :: (MonadState InternState m) => HCId -> Name' HCName -> m (Either String HCName)
+registerImportedName ident val = state $ \st ->
+  case registerImportedNameIn ident val st of
+    Left err -> (Left err, st)
+    Right (node, st') -> (Right node, st')
 
-registerImportedLevel :: HCId -> Level' HCLevel HCName -> InternState -> Either String (HCLevel, InternState)
-registerImportedLevel ident val st
-  | ident == 0 =
-      if val == LZero
-        then Right (zeroLevel, st)
-        else Left "level id 0 is reserved for zero"
-  | otherwise =
-      case (IntMap.lookup ident (internLevelsById st), lookupLevelByVal val st) of
-        (Just existing, _)
-          | hclVal existing == val -> Right (existing, st)
-          | otherwise -> Left $ "conflicting imported level id " <> show ident
-        (Nothing, Just existingByVal) ->
-          Right
-            ( existingByVal,
-              st
-                { internLevelsById = IntMap.insert ident existingByVal $ internLevelsById st
-                }
-            )
-        (Nothing, Nothing) ->
-          let node = HCLevel ident val
-           in Right
-                ( node,
-                  st
-                    { internLevelsById = IntMap.insert ident node $ internLevelsById st,
-                      internLevelsByFingerprint = insertLevelFingerprint node $ internLevelsByFingerprint st
-                    }
-                )
-  where
-    zeroLevel = HCLevel 0 LZero
+registerImportedLevel :: (MonadState InternState m) => HCId -> Level' HCLevel HCName -> m (Either String HCLevel)
+registerImportedLevel ident val = state $ \st ->
+  case registerImportedLevelIn ident val st of
+    Left err -> (Left err, st)
+    Right (node, st') -> (Right node, st')
 
-registerImportedExpr :: HCId -> Expr' HCExpr HCLevel HCName -> InternState -> Either String (HCExpr, InternState)
-registerImportedExpr ident val st =
-  case (IntMap.lookup ident (internExprsById st), lookupExprByVal val st) of
-    (Just existing, _)
-      | hceVal existing == val -> Right (existing, st)
-      | otherwise -> Left $ "conflicting imported expr id " <> show ident
-    (Nothing, Just existingByVal) ->
-      Right
-        ( existingByVal,
-          st
-            { internExprsById = IntMap.insert ident existingByVal $ internExprsById st
-            }
-        )
-    (Nothing, Nothing) ->
-      let node = HCExpr ident val
-       in Right
-            ( node,
-              st
-                { internExprsById = IntMap.insert ident node $ internExprsById st,
-                  internExprsByFingerprint = insertExprFingerprint node $ internExprsByFingerprint st
-                }
-            )
+registerImportedExpr :: (MonadState InternState m) => HCId -> Expr' HCExpr HCLevel HCName -> m (Either String HCExpr)
+registerImportedExpr ident val = state $ \st ->
+  case registerImportedExprIn ident val st of
+    Left err -> (Left err, st)
+    Right (node, st') -> (Right node, st')
 
-internNameVal :: Name' HCName -> InternM HCName
+internNameVal :: (MonadState InternState m) => Name' HCName -> m HCName
 internNameVal Anonymous = do
-  st <- get
-  pure $ maybe (HCName 0 Anonymous) id (IntMap.lookup 0 (internNamesById st))
-internNameVal val = do
-  st <- get
+  gets $ maybe (HCName 0 Anonymous) id . IntMap.lookup 0 . internNamesById
+internNameVal val = state $ \st ->
   case lookupNameByVal val st of
-    Just existing -> pure existing
-    Nothing -> do
+    Just existing -> (existing, st)
+    Nothing ->
       let ident = internNextNameId st
           node = HCName ident val
-      put
-        st
-          { internNextNameId = ident - 1,
-            internNamesById = IntMap.insert ident node $ internNamesById st,
-            internNamesByFingerprint = insertNameFingerprint node $ internNamesByFingerprint st
-          }
-      pure node
+          st' =
+            st
+              { internNextNameId = ident - 1,
+                internNamesById = IntMap.insert ident node $ internNamesById st,
+                internNamesByFingerprint = insertNameFingerprint node $ internNamesByFingerprint st
+              }
+       in (node, st')
 
-internLevelVal :: Level' HCLevel HCName -> InternM HCLevel
+internLevelVal :: (MonadState InternState m) => Level' HCLevel HCName -> m HCLevel
 internLevelVal LZero = do
-  st <- get
-  pure $ maybe (HCLevel 0 LZero) id (IntMap.lookup 0 (internLevelsById st))
-internLevelVal val = do
-  st <- get
+  gets $ maybe (HCLevel 0 LZero) id . IntMap.lookup 0 . internLevelsById
+internLevelVal val = state $ \st ->
   case lookupLevelByVal val st of
-    Just existing -> pure existing
-    Nothing -> do
+    Just existing -> (existing, st)
+    Nothing ->
       let ident = internNextLevelId st
           node = HCLevel ident val
-      put
-        st
-          { internNextLevelId = ident - 1,
-            internLevelsById = IntMap.insert ident node $ internLevelsById st,
-            internLevelsByFingerprint = insertLevelFingerprint node $ internLevelsByFingerprint st
-          }
-      pure node
+          st' =
+            st
+              { internNextLevelId = ident - 1,
+                internLevelsById = IntMap.insert ident node $ internLevelsById st,
+                internLevelsByFingerprint = insertLevelFingerprint node $ internLevelsByFingerprint st
+              }
+       in (node, st')
 
-internExprVal :: Expr' HCExpr HCLevel HCName -> InternM HCExpr
-internExprVal val = do
-  st <- get
+internExprVal :: (MonadState InternState m) => Expr' HCExpr HCLevel HCName -> m HCExpr
+internExprVal val = state $ \st ->
   case lookupExprByVal val st of
-    Just existing -> pure existing
-    Nothing -> do
+    Just existing -> (existing, st)
+    Nothing ->
       let ident = internNextExprId st
           node = HCExpr ident val
-      put
-        st
-          { internNextExprId = ident - 1,
-            internExprsById = IntMap.insert ident node $ internExprsById st,
-            internExprsByFingerprint = insertExprFingerprint node $ internExprsByFingerprint st
-          }
-      pure node
+          st' =
+            st
+              { internNextExprId = ident - 1,
+                internExprsById = IntMap.insert ident node $ internExprsById st,
+                internExprsByFingerprint = insertExprFingerprint node $ internExprsByFingerprint st
+              }
+       in (node, st')
 
-internName :: Name -> InternM HCName
+internName :: (MonadState InternState m) => Name -> m HCName
 internName (Name val) =
   case val of
     Anonymous -> internNameVal Anonymous
@@ -237,7 +182,7 @@ internName (Name val) =
       prefix' <- internName prefix
       internNameVal $ Num prefix' n
 
-internLevel :: Level -> InternM HCLevel
+internLevel :: (MonadState InternState m) => Level -> m HCLevel
 internLevel (Level val) =
   case val of
     LZero -> internLevelVal LZero
@@ -256,7 +201,7 @@ internLevel (Level val) =
       name' <- internName name
       internLevelVal $ LVar name'
 
-internExpr :: Expr -> InternM HCExpr
+internExpr :: (MonadState InternState m) => Expr -> m HCExpr
 internExpr (Expr val) =
   case val of
     BVar idx -> internExprVal $ BVar idx
@@ -285,16 +230,99 @@ internExpr (Expr val) =
       body' <- internExpr body
       internExprVal $ ForallE name' ty' body' binderInfo
     Lit lit -> internExprVal $ Lit lit
-    Let name ty value body -> do
+    Let name ty value body nondep -> do
       name' <- internName name
       ty' <- internExpr ty
       value' <- internExpr value
       body' <- internExpr body
-      internExprVal $ Let name' ty' value' body'
+      internExprVal $ Let name' ty' value' body' nondep
     Proj name idx struct -> do
       name' <- internName name
       struct' <- internExpr struct
       internExprVal $ Proj name' idx struct'
+
+registerImportedNameIn :: HCId -> Name' HCName -> InternState -> Either String (HCName, InternState)
+registerImportedNameIn ident val st
+  | ident == 0 =
+      if val == Anonymous
+        then Right (anonymousName, st)
+        else Left "name id 0 is reserved for anonymous"
+  | otherwise =
+      case (IntMap.lookup ident (internNamesById st), lookupNameByVal val st) of
+        (Just existing, _)
+          | hcnVal existing == val -> Right (existing, st)
+          | otherwise -> Left $ "conflicting imported name id " <> show ident
+        (Nothing, Just existingByVal) ->
+          Right
+            ( existingByVal,
+              st
+                { internNamesById = IntMap.insert ident existingByVal $ internNamesById st
+                }
+            )
+        (Nothing, Nothing) ->
+          let node = HCName ident val
+           in Right
+                ( node,
+                  st
+                    { internNamesById = IntMap.insert ident node $ internNamesById st,
+                      internNamesByFingerprint = insertNameFingerprint node $ internNamesByFingerprint st
+                    }
+                )
+  where
+    anonymousName = HCName 0 Anonymous
+
+registerImportedLevelIn :: HCId -> Level' HCLevel HCName -> InternState -> Either String (HCLevel, InternState)
+registerImportedLevelIn ident val st
+  | ident == 0 =
+      if val == LZero
+        then Right (zeroLevel, st)
+        else Left "level id 0 is reserved for zero"
+  | otherwise =
+      case (IntMap.lookup ident (internLevelsById st), lookupLevelByVal val st) of
+        (Just existing, _)
+          | hclVal existing == val -> Right (existing, st)
+          | otherwise -> Left $ "conflicting imported level id " <> show ident
+        (Nothing, Just existingByVal) ->
+          Right
+            ( existingByVal,
+              st
+                { internLevelsById = IntMap.insert ident existingByVal $ internLevelsById st
+                }
+            )
+        (Nothing, Nothing) ->
+          let node = HCLevel ident val
+           in Right
+                ( node,
+                  st
+                    { internLevelsById = IntMap.insert ident node $ internLevelsById st,
+                      internLevelsByFingerprint = insertLevelFingerprint node $ internLevelsByFingerprint st
+                    }
+                )
+  where
+    zeroLevel = HCLevel 0 LZero
+
+registerImportedExprIn :: HCId -> Expr' HCExpr HCLevel HCName -> InternState -> Either String (HCExpr, InternState)
+registerImportedExprIn ident val st =
+  case (IntMap.lookup ident (internExprsById st), lookupExprByVal val st) of
+    (Just existing, _)
+      | hceVal existing == val -> Right (existing, st)
+      | otherwise -> Left $ "conflicting imported expr id " <> show ident
+    (Nothing, Just existingByVal) ->
+      Right
+        ( existingByVal,
+          st
+            { internExprsById = IntMap.insert ident existingByVal $ internExprsById st
+            }
+        )
+    (Nothing, Nothing) ->
+      let node = HCExpr ident val
+       in Right
+            ( node,
+              st
+                { internExprsById = IntMap.insert ident node $ internExprsById st,
+                  internExprsByFingerprint = insertExprFingerprint node $ internExprsByFingerprint st
+                }
+            )
 
 lookupNameByVal :: Name' HCName -> InternState -> Maybe HCName
 lookupNameByVal val st = do

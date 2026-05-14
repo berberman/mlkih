@@ -35,6 +35,9 @@ instance (HasName n, PrettyPrint n) => PrettyPrint (Name' n) where
 newtype Name = Name {unName :: Name' Name}
   deriving (Show, Eq, Ord)
 
+simpleName :: Text -> Name
+simpleName txt = Name (Str (Name Anonymous) txt)
+
 data HCName = HCName
   { hcnId :: {-# UNPACK #-} !HCId,
     hcnVal :: Name' HCName

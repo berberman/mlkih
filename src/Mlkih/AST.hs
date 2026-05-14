@@ -27,6 +27,7 @@ module Mlkih.AST
     getAppArgs,
     getAppSpine,
     mkAppSpine,
+    isApp,
     viewConstApp,
     viewProj,
     mkProjFromView,
@@ -101,57 +102,64 @@ data LetView = LetView
   { letViewName :: HCName,
     letViewType :: HCExpr,
     letViewValue :: HCExpr,
-    letViewBody :: HCExpr
+    letViewBody :: HCExpr,
+    letViewNondep :: Bool
   }
   deriving (Show, Eq, Ord)
 
 mkLevelZero :: (MonadState s m, HasInternState s) => m HCLevel
-mkLevelZero = runInternState $ internLevelVal LZero
+mkLevelZero = withIntern $ internLevelVal LZero
 
 mkLevelSucc :: (MonadState s m, HasInternState s) => HCLevel -> m HCLevel
-mkLevelSucc level = runInternState $ internLevelVal (LSucc level)
+mkLevelSucc level = withIntern $ internLevelVal (LSucc level)
 
 mkLevelMax :: (MonadState s m, HasInternState s) => HCLevel -> HCLevel -> m HCLevel
-mkLevelMax lhs rhs = runInternState $ internLevelVal (LMax lhs rhs)
+mkLevelMax lhs rhs = withIntern $ internLevelVal (LMax lhs rhs)
 
 mkLevelIMax :: (MonadState s m, HasInternState s) => HCLevel -> HCLevel -> m HCLevel
-mkLevelIMax lhs rhs = runInternState $ internLevelVal (LIMax lhs rhs)
+mkLevelIMax lhs rhs = withIntern $ internLevelVal (LIMax lhs rhs)
 
 mkLevelParam :: (MonadState s m, HasInternState s) => HCName -> m HCLevel
-mkLevelParam name = runInternState $ internLevelVal (LVar name)
+mkLevelParam name = withIntern $ internLevelVal (LVar name)
 
 mkBVar :: (MonadState s m, HasInternState s) => Int -> m HCExpr
-mkBVar idx = runInternState $ internExprVal (BVar idx)
+mkBVar idx = withIntern $ internExprVal (BVar idx)
 
 mkFVar :: (MonadState s m, HasInternState s) => FVarId HCName -> m HCExpr
-mkFVar fvarId = runInternState $ internExprVal (FVar fvarId)
+mkFVar fvarId = withIntern $ internExprVal (FVar fvarId)
 
 mkSort :: (MonadState s m, HasInternState s) => HCLevel -> m HCExpr
-mkSort level = runInternState $ internExprVal (Sort level)
+mkSort level = withIntern $ internExprVal (Sort level)
 
 mkConst :: (MonadState s m, HasInternState s) => HCName -> [HCLevel] -> m HCExpr
-mkConst name levels = runInternState $ internExprVal (Const name levels)
+mkConst name levels = withIntern $ internExprVal (Const name levels)
 
 mkApp :: (MonadState s m, HasInternState s) => HCExpr -> HCExpr -> m HCExpr
-mkApp fn arg = runInternState $ internExprVal (App fn arg)
+mkApp fn arg = withIntern $ internExprVal (App fn arg)
 
 mkApps :: (MonadState s m, HasInternState s) => HCExpr -> [HCExpr] -> m HCExpr
 mkApps = foldM mkApp
 
 mkLam :: (MonadState s m, HasInternState s) => HCName -> HCExpr -> HCExpr -> BinderInfo -> m HCExpr
-mkLam name ty body binderInfo = runInternState $ internExprVal (Lam name ty body binderInfo)
+mkLam name ty body binderInfo = withIntern $ internExprVal (Lam name ty body binderInfo)
 
 mkForall :: (MonadState s m, HasInternState s) => HCName -> HCExpr -> HCExpr -> BinderInfo -> m HCExpr
-mkForall name ty body binderInfo = runInternState $ internExprVal (ForallE name ty body binderInfo)
+mkForall name ty body binderInfo = withIntern $ internExprVal (ForallE name ty body binderInfo)
 
 mkLit :: (MonadState s m, HasInternState s) => Literal -> m HCExpr
-mkLit lit = runInternState $ internExprVal (Lit lit)
+mkLit lit = withIntern $ internExprVal (Lit lit)
 
-mkLet :: (MonadState s m, HasInternState s) => HCName -> HCExpr -> HCExpr -> HCExpr -> m HCExpr
-mkLet name ty value body = runInternState $ internExprVal (Let name ty value body)
+mkLet :: (MonadState s m, HasInternState s) => HCName -> HCExpr -> HCExpr -> HCExpr -> Bool -> m HCExpr
+mkLet name ty value body nondep = withIntern $ internExprVal (Let name ty value body nondep)
 
 mkProj :: (MonadState s m, HasInternState s) => HCName -> Int -> HCExpr -> m HCExpr
-mkProj name idx struct = runInternState $ internExprVal (Proj name idx struct)
+mkProj name idx struct = withIntern $ internExprVal (Proj name idx struct)
+
+isApp :: HCExpr -> Bool
+isApp expr =
+  case hceVal expr of
+    App _ _ -> True
+    _ -> False
 
 getAppFn :: HCExpr -> HCExpr
 getAppFn expr =
@@ -245,13 +253,14 @@ viewForall expr =
 viewLet :: HCExpr -> Maybe LetView
 viewLet expr =
   case hceVal expr of
-    Let name ty value body ->
+    Let name ty value body nondep ->
       Just
         LetView
           { letViewName = name,
             letViewType = ty,
             letViewValue = value,
-            letViewBody = body
+            letViewBody = body,
+            letViewNondep = nondep
           }
     _ -> Nothing
 
@@ -282,7 +291,7 @@ mkForalls binderViews body = foldM mkForallStep body (reverse binderViews)
     mkForallStep inner binderView = mkForall (binderViewName binderView) (binderViewType binderView) inner (binderViewInfo binderView)
 
 mkLetFromView :: (MonadState s m, HasInternState s) => LetView -> m HCExpr
-mkLetFromView letView = mkLet (letViewName letView) (letViewType letView) (letViewValue letView) (letViewBody letView)
+mkLetFromView letView = mkLet (letViewName letView) (letViewType letView) (letViewValue letView) (letViewBody letView) (letViewNondep letView)
 
 openBinderView :: (MonadState s m, HasInternState s) => BinderView -> HCExpr -> m HCExpr
 openBinderView binderView arg = instantiate1 arg (binderViewBody binderView)
@@ -326,11 +335,11 @@ instantiateList depth args expr =
       bndr' <- instantiateList (depth + 1) args bndr
       if ty' == ty && bndr' == bndr then pure expr else mkForall name ty' bndr' bodyInfo
     Lit _ -> pure expr
-    Let name ty val bndr -> do
+    Let name ty val bndr nondep -> do
       ty' <- instantiateList depth args ty
       val' <- instantiateList depth args val
       bndr' <- instantiateList (depth + 1) args bndr
-      if ty' == ty && val' == val && bndr' == bndr then pure expr else mkLet name ty' val' bndr'
+      if ty' == ty && val' == val && bndr' == bndr then pure expr else mkLet name ty' val' bndr' nondep
     Proj name idx struct -> do
       struct' <- instantiateList depth args struct
       if struct' == struct then pure expr else mkProj name idx struct'
@@ -373,13 +382,13 @@ abstractList depth fvarIds expr =
         then pure expr
         else mkForall name ty' body' binderInfo
     Lit _ -> pure expr
-    Let name ty value body -> do
+    Let name ty value body nondep -> do
       ty' <- abstractList depth fvarIds ty
       value' <- abstractList depth fvarIds value
       body' <- abstractList (depth + 1) fvarIds body
       if ty' == ty && value' == value && body' == body
         then pure expr
-        else mkLet name ty' value' body'
+        else mkLet name ty' value' body' nondep
     Proj name idx struct -> do
       struct' <- abstractList depth fvarIds struct
       if struct' == struct
@@ -424,11 +433,11 @@ instantiateLevelParamsBy subst expr =
       body' <- instantiateLevelParamsBy subst body
       if ty' == ty && body' == body then pure expr else mkForall name ty' body' binderInfo
     Lit _ -> pure expr
-    Let name ty value body -> do
+    Let name ty value body nondep -> do
       ty' <- instantiateLevelParamsBy subst ty
       value' <- instantiateLevelParamsBy subst value
       body' <- instantiateLevelParamsBy subst body
-      if ty' == ty && value' == value && body' == body then pure expr else mkLet name ty' value' body'
+      if ty' == ty && value' == value && body' == body then pure expr else mkLet name ty' value' body' nondep
     Proj name idx struct -> do
       struct' <- instantiateLevelParamsBy subst struct
       if struct' == struct then pure expr else mkProj name idx struct'
@@ -453,11 +462,11 @@ instantiateLevelParamsExprBy subst expr =
       body' <- instantiateLevelParamsBy subst body
       mkForall name ty' body' binderInfo
     Lit lit -> mkLit lit
-    Let name ty value body -> do
+    Let name ty value body nondep -> do
       ty' <- instantiateLevelParamsBy subst ty
       value' <- instantiateLevelParamsBy subst value
       body' <- instantiateLevelParamsBy subst body
-      mkLet name ty' value' body'
+      mkLet name ty' value' body' nondep
     Proj name idx struct -> do
       struct' <- instantiateLevelParamsBy subst struct
       mkProj name idx struct'
@@ -512,13 +521,13 @@ liftLooseBVars cutoff delta expr
             then pure expr
             else mkForall name ty' body' binderInfo
         Lit _ -> pure expr
-        Let name ty value body -> do
+        Let name ty value body nondep -> do
           ty' <- liftLooseBVars cutoff delta ty
           value' <- liftLooseBVars cutoff delta value
           body' <- liftLooseBVars (cutoff + 1) delta body
           if ty' == ty && value' == value && body' == body
             then pure expr
-            else mkLet name ty' value' body'
+            else mkLet name ty' value' body' nondep
         Proj name idx struct -> do
           struct' <- liftLooseBVars cutoff delta struct
           if struct' == struct

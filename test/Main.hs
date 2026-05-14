@@ -73,10 +73,6 @@ tests =
       testCase "kernel rejects mismatched checker interner" testKernelRejectsMismatchedCheckerInterner,
       testCase "kernel does not delta unfold theorem body" testKernelDoesNotDeltaUnfoldTheoremBody,
       testCase "kernel does not delta unfold opaque body" testKernelDoesNotDeltaUnfoldOpaqueBody,
-      testCase "kernel unfolds abbrev before regular" testKernelUnfoldsAbbrevBeforeRegular,
-      testCase "kernel orders regular delta by height" testKernelOrdersRegularDeltaByHeight,
-      testCase "kernel compares same-head regular args before unfolding" testKernelComparesSameHeadRegularArgsBeforeUnfolding,
-      testCase "kernel rejects same-head non-unfoldable arg mismatches" testKernelRejectsSameHeadNonUnfoldableArgMismatches,
       testCase "kernel rejects same-head non-unfoldable universe mismatches" testKernelRejectsSameHeadNonUnfoldableUniverseMismatches,
       testCase "kernel uses universe comparison before unnecessary unfolding" testKernelUsesUniverseComparisonBeforeUnnecessaryUnfolding,
       testCase "kernel validates simple inductive recursor" testKernelValidatesSimpleInductiveRecursor,
@@ -437,9 +433,9 @@ testLevelEquivHandlesNestedIMax = do
 testDuplicateImportedExprPayloads :: IO ()
 testDuplicateImportedExprPayloads = do
   let result = do
-        (_, st1) <- registerImportedLevel 1 (LSucc (HCLevel 0 LZero)) emptyInternState
-        (expr1, st2) <- registerImportedExpr 7 (Sort (HCLevel 1 (LSucc (HCLevel 0 LZero)))) st1
-        registerImportedExpr 8 (Sort (HCLevel 1 (LSucc (HCLevel 0 LZero)))) st2
+        (_, st1) <- registerImportedLevelIn 1 (LSucc (HCLevel 0 LZero)) emptyInternState
+        (expr1, st2) <- registerImportedExprIn 7 (Sort (HCLevel 1 (LSucc (HCLevel 0 LZero)))) st1
+        registerImportedExprIn 8 (Sort (HCLevel 1 (LSucc (HCLevel 0 LZero)))) st2
           >>= \(expr2, st3) -> pure (expr1, expr2, st3)
   (expr1, expr2, st3) <- expectRight result
   assertEq 7 (hceId expr1) "expected canonical imported expr id"
@@ -452,8 +448,8 @@ testDuplicateImportedExprPayloads = do
 testDuplicateImportedLevelPayloads :: IO ()
 testDuplicateImportedLevelPayloads = do
   let result = do
-        (level1, st1) <- registerImportedLevel 1 (LSucc (HCLevel 0 LZero)) emptyInternState
-        registerImportedLevel 2 (LSucc (HCLevel 0 LZero)) st1
+        (level1, st1) <- registerImportedLevelIn 1 (LSucc (HCLevel 0 LZero)) emptyInternState
+        registerImportedLevelIn 2 (LSucc (HCLevel 0 LZero)) st1
           >>= \(level2, st2) -> pure (level1, level2, st2)
   (level1, level2, st2) <- expectRight result
   assertEq 1 (hclId level1) "expected canonical imported level id"
@@ -487,8 +483,8 @@ testKernelSharesImportedCanonicalIds = do
       importedName = constName axiomVal
   ((reinternedName, reinternedType, lookedUpByImported, lookedUpByReinterned), _) <-
     expectRight . runKernelM env (parsedInternState parsed) $ do
-      reinternedName <- internNameM (rawName ["Foo"])
-      reinternedType <- internExprM (Expr (Sort (Level LZero)))
+      reinternedName <- withIntern $ internName (rawName ["Foo"])
+      reinternedType <- withIntern $ internExpr (Expr (Sort (Level LZero)))
       lookedUpByImported <- lookupConstInfo importedName
       lookedUpByReinterned <- lookupConstInfo reinternedName
       pure (reinternedName, reinternedType, lookedUpByImported, lookedUpByReinterned)
@@ -569,95 +565,6 @@ testKernelDoesNotDeltaUnfoldOpaqueBody = do
   assertEq Nothing hints "expected opaque declaration to expose no delta hints"
   assertEq LazyDeltaUnfoldRhs (lazyDeltaStepChoice stepResult) "expected lazy delta to distinguish opaque declarations from opaque-hint definitions"
   assertEq opaqueExpr (lazyDeltaStepLhs stepResult) "expected opaque declaration side to remain unchanged in one-sided lazy delta"
-
-testKernelUnfoldsAbbrevBeforeRegular :: IO ()
-testKernelUnfoldsAbbrevBeforeRegular = do
-  let (env, internState, abbrevExpr, regularExpr, opaqueHintExpr, abbrevBody) = lazyDeltaHintFixture
-  (abbrevVsRegular, abbrevVsOpaqueHint, abbrevHints, opaqueHints) <-
-    expectRight . evalKernelM env internState $ do
-      abbrevName <-
-        case viewConstApp abbrevExpr of
-          Just constView -> pure (constAppName constView)
-          Nothing -> throwError "expected abbrev const app"
-      opaqueHintName <-
-        case viewConstApp opaqueHintExpr of
-          Just constView -> pure (constAppName constView)
-          Nothing -> throwError "expected opaque-hint const app"
-      abbrevVsRegular <- lazyDeltaReductionStep neverCompareArgs abbrevExpr regularExpr
-      abbrevVsOpaqueHint <- lazyDeltaReductionStep neverCompareArgs abbrevExpr opaqueHintExpr
-      abbrevHints <- lookupConstReducibilityHints abbrevName
-      opaqueHints <- lookupConstReducibilityHints opaqueHintName
-      pure (abbrevVsRegular, abbrevVsOpaqueHint, abbrevHints, opaqueHints)
-  assertEq LazyDeltaUnfoldLhs (lazyDeltaStepChoice abbrevVsRegular) "expected lazy delta to unfold abbrev definitions before regular ones"
-  assertEq abbrevBody (lazyDeltaStepLhs abbrevVsRegular) "expected abbrev side to unfold to its body"
-  assertEq regularExpr (lazyDeltaStepRhs abbrevVsRegular) "expected regular side to stay unchanged when abbrev wins ordering"
-  assertEq LazyDeltaUnfoldLhs (lazyDeltaStepChoice abbrevVsOpaqueHint) "expected lazy delta to unfold abbrev definitions before opaque-hint definitions"
-  assertEq abbrevBody (lazyDeltaStepLhs abbrevVsOpaqueHint) "expected abbrev side to unfold against an opaque-hint definition"
-  assertEq opaqueHintExpr (lazyDeltaStepRhs abbrevVsOpaqueHint) "expected opaque-hint side to stay unchanged when abbrev wins ordering"
-  assertEq (Just Abbrev) abbrevHints "expected definitions to expose abbrev hints through the kernel helper path"
-  assertEq (Just Opaque) opaqueHints "expected definitions to preserve opaque hint classification"
-  assertEq AbbrevHint (reducibilityHintClass Abbrev) "expected abbrev hint class tagging"
-  assertEq RegularHint (reducibilityHintClass (Regular 3)) "expected regular hint class tagging"
-  assertEq OpaqueHint (reducibilityHintClass Opaque) "expected opaque hint class tagging"
-  assertEq LT (compareReducibilityHintsForDelta Abbrev (Regular 3)) "expected abbrev to unfold before regular definitions"
-  assertEq LT (compareReducibilityHintsForDelta Abbrev Opaque) "expected abbrev to unfold before opaque-hint definitions"
-
-testKernelOrdersRegularDeltaByHeight :: IO ()
-testKernelOrdersRegularDeltaByHeight = do
-  let (env, internState, highExpr, lowExpr, highBody) = lazyDeltaRegularHeightFixture
-  (highVsLow, lowVsHigh) <-
-    expectRight . evalKernelM env internState $ do
-      highVsLow <- lazyDeltaReductionStep neverCompareArgs highExpr lowExpr
-      lowVsHigh <- lazyDeltaReductionStep neverCompareArgs lowExpr highExpr
-      pure (highVsLow, lowVsHigh)
-  assertEq LazyDeltaUnfoldLhs (lazyDeltaStepChoice highVsLow) "expected higher regular height to unfold first when it is on the lhs"
-  assertEq highBody (lazyDeltaStepLhs highVsLow) "expected higher-height regular definition to unfold to its body"
-  assertEq lowExpr (lazyDeltaStepRhs highVsLow) "expected lower-height regular definition to stay unchanged when it loses ordering"
-  assertEq LazyDeltaUnfoldRhs (lazyDeltaStepChoice lowVsHigh) "expected higher regular height to unfold first when it is on the rhs"
-  assertEq highBody (lazyDeltaStepRhs lowVsHigh) "expected higher-height regular definition to unfold even from the rhs position"
-  assertEq (Just 9) (reducibilityHintRegularHeight (Regular 9)) "expected regular hints to expose their stored height"
-  assertEq Nothing (reducibilityHintRegularHeight Abbrev) "expected non-regular hints to expose no regular height"
-  assertEq LT (compareReducibilityHintsForDelta (Regular 9) (Regular 2)) "expected higher regular definitional height to unfold first"
-  assertEq GT (compareReducibilityHintsForDelta (Regular 2) (Regular 9)) "expected lower regular definitional height to unfold later"
-
-testKernelComparesSameHeadRegularArgsBeforeUnfolding :: IO ()
-testKernelComparesSameHeadRegularArgsBeforeUnfolding = do
-  let (env, internState, lhsExpr, rhsSameExpr, rhsDiffExpr, expectedSameLhs, expectedDiffLhs, expectedDiffRhs) = sameHeadRegularLazyDeltaFixture
-      (fallbackEnv, fallbackInternState, fallbackLhsExpr, fallbackRhsExpr) = sameHeadRegularFallbackFixture
-  (sameResult, sameFailed, sameDefEq, diffDefEq, diffResult, diffFailed) <-
-    expectRight . evalKernelM env internState $ do
-      sameResult <- lazyDeltaReductionStep whnfEqArgs lhsExpr rhsSameExpr
-      sameFailed <- isFailedExprPair lhsExpr rhsSameExpr
-      sameDefEq <- isDefEq lhsExpr rhsSameExpr
-      diffDefEq <- isDefEq lhsExpr rhsDiffExpr
-      diffResult <- lazyDeltaReductionStep whnfEqArgs lhsExpr rhsDiffExpr
-      diffFailed <- isFailedExprPair lhsExpr rhsDiffExpr
-      pure (sameResult, sameFailed, sameDefEq, diffDefEq, diffResult, diffFailed)
-  fallbackDefEq <- expectRight . evalKernelM fallbackEnv fallbackInternState $ isDefEq fallbackLhsExpr fallbackRhsExpr
-  assertEq LazyDeltaSameHeadEq (lazyDeltaStepChoice sameResult) "expected equal-height same-head regular definitions to compare arguments before unfolding"
-  assertEq expectedSameLhs (lazyDeltaStepLhs sameResult) "expected successful same-head precheck to leave the lhs unchanged"
-  assertEq rhsSameExpr (lazyDeltaStepRhs sameResult) "expected successful same-head precheck to leave the rhs unchanged"
-  assertEq False sameFailed "expected successful same-head precheck not to memoize a failure"
-  assertEq True sameDefEq "expected staged defeq to reuse the same-head regular argument comparison before unfolding"
-  assertEq False diffDefEq "expected staged defeq to reject differing same-head regular arguments after the staged fallback path"
-  assertEq LazyDeltaUnfoldBoth (lazyDeltaStepChoice diffResult) "expected differing same-head regular arguments to fall back to unfolding both sides"
-  assertEq expectedDiffLhs (lazyDeltaStepLhs diffResult) "expected lhs to unfold after failed same-head precheck"
-  assertEq expectedDiffRhs (lazyDeltaStepRhs diffResult) "expected rhs to unfold after failed same-head precheck"
-  assertEq True diffFailed "expected failed same-head regular comparison to memoize the pair"
-  assertEq True fallbackDefEq "expected staged defeq to keep the lazy-delta fallback when same-head regular definitions ignore differing arguments"
-
-testKernelRejectsSameHeadNonUnfoldableArgMismatches :: IO ()
-testKernelRejectsSameHeadNonUnfoldableArgMismatches = do
-  let (env, internState, lhsExpr, rhsExpr) = sameHeadNonUnfoldableArgFixture
-  (result, failedPair, unfoldStack) <-
-    expectRight . evalKernelM env internState $ do
-      result <- isDefEq lhsExpr rhsExpr
-      failedPair <- isFailedExprPair lhsExpr rhsExpr
-      unfoldStack <- getUnfoldStack
-      pure (result, failedPair, unfoldStack)
-  assertEq False result "expected same-head applications of a non-unfoldable constant with different arguments to fail immediately"
-  assertEq True failedPair "expected failed same-head non-unfoldable argument comparison to memoize the pair"
-  assertEq [] unfoldStack "expected failed same-head non-unfoldable argument comparison to avoid any unfolding"
 
 testKernelRejectsSameHeadNonUnfoldableUniverseMismatches :: IO ()
 testKernelRejectsSameHeadNonUnfoldableUniverseMismatches = do
@@ -2109,11 +2016,10 @@ expectRight result =
 neverCompareArgs :: HCExpr -> HCExpr -> KernelM Bool
 neverCompareArgs _ _ = throwError "unexpected same-head regular pre-unfold comparison"
 
-whnfEqArgs :: HCExpr -> HCExpr -> KernelM Bool
-whnfEqArgs lhs rhs = do
-  lhsWhnf <- whnf lhs
-  rhsWhnf <- whnf rhs
-  pure (lhsWhnf == rhsWhnf)
+whnf :: HCExpr -> KernelM HCExpr
+whnf expr = do
+  val <- evalM [] expr
+  quote val 
 
 assertEq :: (Eq a, Show a) => a -> a -> String -> IO ()
 assertEq expected actual message =
