@@ -5,6 +5,7 @@ module Mlkih.Kernel.Eval where
 
 import Control.Monad (foldM, unless, zipWithM)
 import Control.Monad.Except
+import Debug.Trace (traceM)
 import Mlkih.AST
 import Mlkih.Env
 import Mlkih.Expr
@@ -12,10 +13,11 @@ import Mlkih.Intern
 import Mlkih.Kernel.Types
 import Mlkih.Level
 import Mlkih.Name
+import Mlkih.Pretty
 
 --------------------------------------------------------------------------------
 
-evalM :: Env -> HCExpr -> KernelM Value
+evalM :: LocalEnv -> HCExpr -> KernelM Value
 evalM env expr = case hceVal expr of
   BVar idx -> pure $ env !! idx
   FVar fv -> pure $ VNeutral (HFVar fv) []
@@ -151,8 +153,6 @@ applyElimM (VNeutral (HConst recName recLvls) spine) elim = do
                 else fallback
     _ -> fallback
 applyElimM (VNeutral head spine) elim =
-  -- Iota Reduction (Projections & Recursors)
-  -- TODO: Iota reduction logic (including K-rule which calls isDefEq)
   pure $ VNeutral head (elim : spine)
 applyElimM (VDef name levels spine thunk) elim = do
   -- We push the elimination to the spine, and also to the lazy thunk
@@ -184,112 +184,109 @@ isDefEqValue val1 val2 = case (val1, val2) of
           _ -> False
     if isProp
       then pure True -- Proof irrelevance
-      else case (val1, val2) of
-        (VLam n1 _ ty1 clo1, VLam _ _ ty2 clo2) -> do
-          typesEq <- isDefEqValue ty1 ty2
-          if not typesEq
-            then pure False
-            else do
-              fv <- freshFVar n1
-              let fvVal = VNeutral (HFVar fv) []
+      else do
+        -- Try Zeta reduction early
+        z1 <- tryZeta val1
+        case z1 of
+          Just u1 -> isDefEqValue u1 val2
+          Nothing -> do
+            z2 <- tryZeta val2
+            case z2 of
+              Just u2 -> isDefEqValue val1 u2
+              Nothing -> matchCore val1 val2
+  where
+    tryZeta :: Value -> KernelM (Maybe Value)
+    tryZeta (VNeutral (HFVar f) s) = do
+      mDecl <- lookupLocalValue f
+      case mDecl of
+        Just letVal -> Just <$> applyElimsM letVal s
+        Nothing -> pure Nothing
+    tryZeta _ = pure Nothing
+
+    matchCore :: Value -> Value -> KernelM Bool
+    matchCore v1 v2 = case (v1, v2) of
+      (VLam n1 _ ty1 clo1, VLam _ _ ty2 clo2) -> do
+        typesEq <- isDefEqValue ty1 ty2
+        if not typesEq
+          then pure False
+          else do
+            fv <- freshFVar n1
+            let fvVal = VNeutral (HFVar fv) []
+            withLocalDecl fv (LocalDecl ty1 Nothing) $ do
               body1 <- evalM (fvVal : closureEnv clo1) (closureBody clo1)
               body2 <- evalM (fvVal : closureEnv clo2) (closureBody clo2)
               isDefEqValue body1 body2
-        (VPi n1 _ ty1 clo1, VPi _ _ ty2 clo2) -> do
-          typesEq <- isDefEqValue ty1 ty2
-          if not typesEq
-            then pure False
-            else do
-              fv <- freshFVar n1
-              let fvVal = VNeutral (HFVar fv) []
+      (VPi n1 _ ty1 clo1, VPi _ _ ty2 clo2) -> do
+        typesEq <- isDefEqValue ty1 ty2
+        if not typesEq
+          then pure False
+          else do
+            fv <- freshFVar n1
+            let fvVal = VNeutral (HFVar fv) []
+            withLocalDecl fv (LocalDecl ty1 Nothing) $ do
               body1 <- evalM (fvVal : closureEnv clo1) (closureBody clo1)
               body2 <- evalM (fvVal : closureEnv clo2) (closureBody clo2)
               isDefEqValue body1 body2
-        (VNeutral (HFVar f1) s1, s2) -> do
-          mDecl <- lookupLocalValue f1
-          case mDecl of
-            Just letVal -> do
-              -- Unfold the let-binding and apply the spine
-              unfolded1 <- applyElimsM letVal s1
-              isDefEqValue unfolded1 val2
-            Nothing ->
-              -- It is a nondep let or a lambda binder
-              -- It remains opaque. Fall through to failure
-              case s2 of
-                VNeutral (HFVar f2) s2' | f1 == f2 -> isDefEqSpine s1 s2'
-                _ -> pure False
-        (s1, (VNeutral (HFVar f2) s2)) -> do
-          mDecl <- lookupLocalValue f2
-          case mDecl of
-            Just letVal -> do
-              unfolded2 <- applyElimsM letVal s2
-              isDefEqValue val1 unfolded2
-            Nothing ->
-              case s1 of
-                VNeutral (HFVar f1) s1' | f1 == f2 -> isDefEqSpine s1' s2
-                _ -> pure False
-        (VNeutral h1 s1, VNeutral h2 s2)
-          | h1 == h2 -> isDefEqSpine s1 s2
-        (VDef n1 _ s1 _, VDef n2 _ s2 _) | n1 == n2 -> do
-          -- Try fast path
-          match <- isDefEqSpine s1 s2 `catchError` \_ -> pure False
-          if match
-            then pure True
-            else do
-              -- Fallback to forcing
-              v1 <- force val1
-              v2 <- force val2
-              isDefEqValue v1 v2
-        (VDef n1 _ _ thunk1, VDef n2 _ _ thunk2) -> do
-          hint1 <- getDefHints n1
-          hint2 <- getDefHints n2
-          case compare hint1 hint2 of
-            LT -> do
-              -- Left is more reducible
-              v1 <- thunk1
-              isDefEqValue v1 val2
-            GT -> do
-              -- Right is more reducible
-              v2 <- thunk2
-              isDefEqValue val1 v2
-            EQ -> do
-              -- Heights are equal.
-              -- If both are Opaque, we fail immediately because n1 != n2.
-              if hint1 == Opaque
-                then pure False
-                else do
-                  withUnfoldingConst n1 $ do
-                    v1 <- thunk1
-                    withUnfoldingConst n2 $ do
-                      v2 <- thunk2
-                      isDefEqValue v1 v2
-        -- Left side is a Definition, Right side is something else
-        (VDef n1 _ _ thunk1, _) -> do
-          hint1 <- getDefHints n1
-          if hint1 == Opaque
-            then pure False -- Never unfold opaque definitions!
-            else do
-              withUnfoldingConst n1 $ do
-                v1 <- thunk1
-                isDefEqValue v1 val2
-        -- Right side is a Definition, Left side is something else
-        (_, VDef n2 _ _ thunk2) -> do
-          hint2 <- getDefHints n2
-          if hint2 == Opaque
-            then pure False
-            else do
-              withUnfoldingConst n2 $ do
-                v2 <- thunk2
-                isDefEqValue val1 v2
-        -- Functional Eta Expansion
-        (VLam n _ _ clo, other) -> checkEta n clo other
-        (other, VLam n _ _ clo) -> checkEta n clo other
-        -- Structural Eta Expansion
-        (VNeutral (HConst c1 _) s1, other) ->
-          checkStructEta c1 s1 other `catchError` \_ -> pure False
-        (other, VNeutral (HConst c2 _) s2) ->
-          checkStructEta c2 s2 other `catchError` \_ -> pure False
-        _ -> pure False
+      (VNeutral h1 s1, VNeutral h2 s2)
+        | h1 == h2 -> isDefEqSpine s1 s2
+      (VDef n1 _ s1 _, VDef n2 _ s2 _) | n1 == n2 -> do
+        match <- isDefEqSpine s1 s2 `catchError` \_ -> pure False
+        if match
+          then pure True
+          else do
+            fv1 <- force v1
+            fv2 <- force v2
+            isDefEqValue fv1 fv2
+      (VDef n1 _ _ thunk1, VDef n2 _ _ thunk2) -> do
+        hint1 <- getDefHints n1
+        hint2 <- getDefHints n2
+        case compare hint1 hint2 of
+          LT -> do
+            fv1 <- thunk1
+            isDefEqValue fv1 v2
+          GT -> do
+            fv2 <- thunk2
+            isDefEqValue v1 fv2
+          EQ -> do
+            if hint1 == Opaque
+              then pure False
+              else do
+                withUnfoldingConst n1 $ do
+                  fv1 <- thunk1
+                  withUnfoldingConst n2 $ do
+                    fv2 <- thunk2
+                    isDefEqValue fv1 fv2
+      (VDef n1 _ _ thunk1, _) -> do
+        hint1 <- getDefHints n1
+        if hint1 == Opaque
+          then pure False
+          else do
+            withUnfoldingConst n1 $ do
+              fv1 <- thunk1
+              isDefEqValue fv1 v2
+      (_, VDef n2 _ _ thunk2) -> do
+        hint2 <- getDefHints n2
+        if hint2 == Opaque
+          then pure False
+          else do
+            withUnfoldingConst n2 $ do
+              fv2 <- thunk2
+              isDefEqValue v1 fv2
+      (VLam n _ ty clo, other) -> checkEta n ty clo other
+      (other, VLam n _ ty clo) -> checkEta n ty clo other
+      (VNeutral (HConst c1 _) s1, other) -> do
+        traceEval "StructEta" $ "Checking LHS const: " ++ toString c1
+        checkStructEta c1 s1 other `catchError` \e -> do
+          traceEval "StructEta" $ "LHS checkStructEta threw: " ++ e
+          pure False
+      (other, VNeutral (HConst c2 _) s2) -> do
+        traceEval "StructEta" $ "Checking RHS const: " ++ toString c2
+        checkStructEta c2 s2 other `catchError` \e -> do
+          traceEval "StructEta" $ "RHS checkStructEta threw: " ++ e
+          pure False
+      _ -> do
+        traceEval "isDefEqValue" $ "matchCore fallback reached False."
+        pure False
 
 inferValue :: Value -> KernelM Value
 inferValue val = case val of
@@ -336,7 +333,7 @@ ensurePi val = do
     VPi n bi ty clo -> pure (n, bi, ty, clo)
     _ -> throwError "Expected a Pi (Forall) type"
 
-inferExpr :: Env -> HCExpr -> KernelM Value
+inferExpr :: LocalEnv -> HCExpr -> KernelM Value
 inferExpr env expr = case hceVal expr of
   Sort lvl -> pure $ VSort lvl
   Lit (NatVal _) -> do
@@ -518,7 +515,7 @@ extractPiDomain piVal = do
 isDefEq :: HCExpr -> HCExpr -> KernelM Bool
 isDefEq = isDefEq' []
 
-isDefEq' :: Env -> HCExpr -> HCExpr -> KernelM Bool
+isDefEq' :: LocalEnv -> HCExpr -> HCExpr -> KernelM Bool
 isDefEq' env e1 e2 = do
   failed <- isFailedExprPair e1 e2
   if failed
@@ -532,7 +529,7 @@ isDefEq' env e1 e2 = do
           unless success $ recordFailedExprPair e1 e2
           pure success
 
-isDefEqExprCore :: Env -> HCExpr -> HCExpr -> KernelM Bool
+isDefEqExprCore :: LocalEnv -> HCExpr -> HCExpr -> KernelM Bool
 isDefEqExprCore env expr1 expr2
   | expr1 == expr2 = pure True
   | Sort l1 <- hceVal expr1,
@@ -568,7 +565,10 @@ isDefEqExprCore env expr1 expr2
                         fvExpr <- mkFVar fv
                         b1' <- instantiate1 fvExpr b1
                         b2' <- instantiate1 fvExpr b2
-                        isDefEq' env b1' b2'
+                        tyVal <- evalM env ty1
+                        valVal <- evalM env v1
+                        let decl = LocalDecl tyVal (if nd1 then Nothing else Just valVal)
+                        withLocalDecl fv decl $ isDefEq' env b1' b2'
             )
               `catchError` \_ -> pure False
           if fastSuccess then pure True else fallbackToWHNF
@@ -600,7 +600,9 @@ isDefEqExprCore env expr1 expr2
                 fvExpr <- mkFVar fv
                 b1' <- instantiate1 fvExpr b1
                 b2' <- instantiate1 fvExpr b2
-                isDefEq' env b1' b2'
+                tyVal <- evalM env ty1
+                let decl = LocalDecl tyVal Nothing
+                withLocalDecl fv decl $ isDefEq' env b1' b2'
         )
           `catchError` \_ -> pure False
       if fastSuccess then pure True else fallbackToWHNF
@@ -617,7 +619,9 @@ isDefEqExprCore env expr1 expr2
                 fvExpr <- mkFVar fv
                 b1' <- instantiate1 fvExpr b1
                 b2' <- instantiate1 fvExpr b2
-                isDefEq' env b1' b2'
+                tyVal <- evalM env ty1
+                let decl = LocalDecl tyVal Nothing
+                withLocalDecl fv decl $ isDefEq' env b1' b2'
         )
           `catchError` \_ -> pure False
       if fastSuccess then pure True else fallbackToWHNF
@@ -638,39 +642,49 @@ isDefEqElim (EApp v1) (EApp v2) = isDefEqValue v1 v2
 isDefEqElim (EProj _ i1) (EProj _ i2) = pure (i1 == i2)
 isDefEqElim _ _ = pure False
 
-checkEta :: HCName -> Closure -> Value -> KernelM Bool
-checkEta name clo otherVal = do
+checkEta :: HCName -> Value -> Closure -> Value -> KernelM Bool
+checkEta name ty clo otherVal = do
   fv <- freshFVar name
   let fvVal = VNeutral (HFVar fv) []
-  body1 <- evalM (fvVal : closureEnv clo) (closureBody clo)
-  body2 <- applyElimM otherVal (EApp fvVal)
-  isDefEqValue body1 body2
+  withLocalDecl fv (LocalDecl ty Nothing) $ do
+    body1 <- evalM (fvVal : closureEnv clo) (closureBody clo)
+    body2 <- applyElimM otherVal (EApp fvVal)
+    isDefEqValue body1 body2
 
 checkStructEta :: HCName -> Spine -> Value -> KernelM Bool
 checkStructEta ctorName spine otherVal = do
+  traceM $ "[checkStructEta] Triggered for " ++ toString ctorName
   mInfo <- lookupConstInfo ctorName
   case mInfo of
     Just (CtorInfo ctorVal) -> do
       let indName = ctorInductive ctorVal
+      traceM $ "[checkStructEta] Found Inductive: " ++ toString indName
       mIndInfo <- lookupConstInfo indName
       case mIndInfo of
         Just (InductInfo indVal)
           | length (indCtors indVal) == 1
               && indIndicesN indVal
                 == 0 -> do
+              traceM $ "[checkStructEta] Structure verified."
               -- Extract the constructor's field from spine
               -- spine is reversed: [f_n-1, ..., f0, ctorParams...]
               let fieldsN = ctorFieldsN ctorVal
                   ctorFieldsReversed = take fieldsN spine
                   ctorFields = reverse ctorFieldsReversed
+              traceM $ "[checkStructEta] Number of fields: " ++ show fieldsN
               ctorFieldVals <- mapM extractArgM ctorFields
               let projIndices = [0 .. fieldsN - 1]
                   checkField i expectedVal = do
+                    traceM $ "[checkStructEta] Checking projection field " ++ show i
                     projVal <- applyElimM otherVal (EProj indName i)
                     isDefEqValue expectedVal projVal
               and <$> zipWithM checkField projIndices ctorFieldVals
-        _ -> pure False
-    _ -> pure False
+        _ -> do
+          traceM $ "[checkStructEta] Not a structure (indices != 0 or ctors != 1)."
+          pure False
+    _ -> do
+      traceM $ "[checkStructEta] Not a constructor."
+      pure False
 
 -- | Converts a WHNF Value back into a fully normalized AST
 quote :: Value -> KernelM HCExpr
@@ -708,3 +722,6 @@ quoteElim headExpr (EApp argVal) = do
   mkApp headExpr argExpr
 quoteElim headExpr (EProj name idx) =
   mkProj name idx headExpr
+
+traceEval :: String -> String -> KernelM ()
+traceEval phase info = traceM $ "[" ++ phase ++ "] " ++ info

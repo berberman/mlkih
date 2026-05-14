@@ -239,10 +239,10 @@ modifyGlobalEnv f = do
 
 --------------------------------------------------------------------------------
 
-type Env = [Value]
+type LocalEnv = [Value]
 
 data Closure = Closure
-  { closureEnv :: Env,
+  { closureEnv :: LocalEnv,
     closureBody :: HCExpr
   }
   deriving (Show)
@@ -274,7 +274,7 @@ data Value
   deriving (Show)
 
 instance PrettyPrint Closure where
-  ppr (Closure env body) = text "Closure" <> parens (text "env:" <+> brackets (hcatWithComma (map ppr env)) <+> text "body:" <+> ppr body)
+  ppr (Closure env body) = text "Closure" <> parens (text "local env:" <+> brackets (hcatWithComma (map ppr env)) <+> text "body:" <+> ppr body)
 
 instance PrettyPrint Elim where
   ppr elim =
