@@ -31,11 +31,11 @@ instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (InductiveDecl e l) where
   ppr indDecl =
     text "inductive-block"
       <+> braces
-        ( (text "types =" <+> brackets (hcatWithComma (fmap ppr (indTypes indDecl))))
+        ( (text "types =" <+> ppr (indTypes indDecl))
             <> text ", ctors = "
-            <> brackets (hcatWithComma (fmap ppr (indConstructors indDecl)))
+            <> ppr (indConstructors indDecl)
             <> text ", recs = "
-            <> brackets (hcatWithComma (fmap ppr (indRecursors indDecl)))
+            <> (ppr (indRecursors indDecl))
         )
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (Decl e l) where

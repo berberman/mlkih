@@ -1,5 +1,9 @@
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeSynonymInstances #-}
 
 module Mlkih.Kernel.Types where
 
@@ -16,6 +20,7 @@ import Mlkih.Level
 import Mlkih.Name
 import Mlkih.Pretty
 import Mlkih.Types
+import Text.PrettyPrint (nest, vcat)
 
 --------------------------------------------------------------------------------
 
@@ -52,7 +57,8 @@ data KernelState = KernelState
     checkNextLocalId :: !Int,
     checkUnfoldStack :: ![HCName],
     checkVisited :: ![(HCId, HCId)],
-    checkFailed :: ![(HCId, HCId)]
+    checkFailed :: ![(HCId, HCId)],
+    checkTraceStack :: ![[TraceNode]]
   }
 
 instance HasInternState KernelState where
@@ -61,37 +67,156 @@ instance HasInternState KernelState where
 
 type KernelError = String
 
-newtype KernelM a = KernelM
-  {unKernelM :: ReaderT KernelCtx (StateT KernelState (Either KernelError)) a}
-  deriving (Functor, Applicative, Monad, MonadReader KernelCtx, MonadState KernelState, MonadError KernelError)
+newtype KernelM a = KernelM {unKernelM :: KernelCtx -> KernelState -> (Either KernelError a, KernelState)}
+
+instance Functor KernelM where
+  fmap f (KernelM m) = KernelM $ \ctx st ->
+    case m ctx st of
+      (Right a, st') -> (Right (f a), st')
+      (Left err, st') -> (Left err, st')
+  {-# INLINE fmap #-}
+
+instance Applicative KernelM where
+  pure a = KernelM $ \_ st -> (Right a, st)
+  {-# INLINE pure #-}
+  KernelM mf <*> KernelM ma = KernelM $ \ctx st ->
+    case mf ctx st of
+      (Left err, st') -> (Left err, st')
+      (Right f, st') -> case ma ctx st' of
+        (Left err, st'') -> (Left err, st'')
+        (Right a, st'') -> (Right (f a), st'')
+  {-# INLINE (<*>) #-}
+
+instance Monad KernelM where
+  return = pure
+  KernelM m >>= f = KernelM $ \ctx st ->
+    case m ctx st of
+      (Left err, st') -> (Left err, st')
+      (Right a, st') -> unKernelM (f a) ctx st'
+  {-# INLINE (>>=) #-}
+
+instance MonadReader KernelCtx KernelM where
+  ask = KernelM $ \ctx st -> (Right ctx, st)
+  {-# INLINE ask #-}
+  local f (KernelM m) = KernelM $ \ctx st -> m (f ctx) st
+  {-# INLINE local #-}
+
+instance MonadState KernelState KernelM where
+  get = KernelM $ \_ st -> (Right st, st)
+  {-# INLINE get #-}
+  put !newSt = KernelM $ \_ _ -> (Right (), newSt)
+  {-# INLINE put #-}
+
+instance MonadError KernelError KernelM where
+  throwError err = KernelM $ \_ st -> (Left err, st)
+  {-# INLINE throwError #-}
+  catchError (KernelM m) handler = KernelM $ \ctx st ->
+    case m ctx st of
+      (Left err, st') -> unKernelM (handler err) ctx st'
+      success -> success
+  {-# INLINE catchError #-}
+
+instance MonadFail KernelM where
+  fail = throwError
+  {-# INLINE fail #-}
 
 instance Show (KernelM a) where
-  show _ = "<KernelM>"
+  show _ = "<thunk>"
 
 emptyKernelState :: KernelState
-emptyKernelState = KernelState {checkInternState = emptyInternState, checkNextLocalId = 0, checkUnfoldStack = [], checkVisited = [], checkFailed = []}
+emptyKernelState = KernelState {checkInternState = emptyInternState, checkNextLocalId = 0, checkUnfoldStack = [], checkVisited = [], checkFailed = [], checkTraceStack = []}
 
 emptyKernelCtx :: KernelEnv -> KernelCtx
 emptyKernelCtx env = KernelCtx {checkEnv = env, checkLocalCtx = [], checkMetadata = ValidatedKernelMetadata IntMap.empty IntMap.empty}
 
 -- | Runs the kernel, returning both the result and the final state
-runKernelM :: KernelEnv -> InternState -> KernelM a -> Either String (a, KernelState)
-runKernelM env internSt action = runStateT (runReaderT (unKernelM action) (emptyKernelCtx env)) (emptyKernelState {checkInternState = internSt})
+runKernelM :: KernelEnv -> InternState -> KernelM a -> (Either KernelError a, KernelState)
+runKernelM env internSt action = (unKernelM action) (emptyKernelCtx env) (emptyKernelState {checkInternState = internSt})
 
 -- | Evaluates the kernel, discarding the final state
-evalKernelM :: KernelEnv -> InternState -> KernelM a -> Either String a
-evalKernelM env internSt action = fst <$> runKernelM env internSt action
+evalKernelM :: KernelEnv -> InternState -> KernelM a -> Either KernelError a
+evalKernelM env internSt action = fst $ runKernelM env internSt action
 
 -- | Executes the kernel, discarding the result and keeping the state
-execKernelM :: KernelEnv -> InternState -> KernelM a -> Either String KernelState
-execKernelM env internSt action = snd <$> runKernelM env internSt action
+execKernelM :: KernelEnv -> InternState -> KernelM a -> Either KernelError KernelState
+execKernelM env internSt action = case runKernelM env internSt action of
+  (Left err, _) -> Left err
+  (Right _, st) -> Right st
+
+--------------------------------------------------------------------------------
+
+data TraceNode
+  = TraceMessage Doc
+  | TraceBlock Doc [TraceNode]
+  | TraceError Doc
+
+instance PrettyPrint TraceNode where
+  ppr (TraceMessage d) = green (text "⊢") <+> d
+  ppr (TraceError d) = bold (red (text "✗" <+> d))
+  ppr (TraceBlock name children) =
+    vcat ((bold (blue (text "▼" <+> name))) : map (nest 2 . ppr) children)
+
+traceMsgM :: (PrettyPrint a) => a -> KernelM ()
+traceMsgM item = modify' $ \s ->
+  case checkTraceStack s of
+    (currentLevel : rest) -> s {checkTraceStack = (currentLevel <> [TraceMessage (ppr item)]) : rest}
+    [] -> s {checkTraceStack = [[TraceMessage (ppr item)]]}
+
+withTraceNode :: Doc -> KernelM a -> KernelM a
+withTraceNode blockDoc action = do
+  -- Push empty level
+  modify' $ \s -> s {checkTraceStack = [] : checkTraceStack s}
+
+  -- Run action catching errors
+  res <-
+    catchError
+      action
+      ( \err -> do
+          -- If it fails, append the error to the trace structurally
+          modify' $ \s -> case checkTraceStack s of
+            (lvl : rest) -> s {checkTraceStack = (lvl ++ [TraceError (text err)]) : rest}
+            [] -> s
+          throwError err
+      )
+
+  -- Pop level and wrap in Block
+  modify' $ \s ->
+    case checkTraceStack s of
+      (completedLevel : parentLevel : rest) ->
+        let block = TraceBlock blockDoc completedLevel
+         in s {checkTraceStack = (parentLevel ++ [block]) : rest}
+      _ -> s
+
+  pure res
+
+renderKernelTrace :: KernelState -> Doc
+renderKernelTrace st = case checkTraceStack st of
+  [] -> text "No trace generated."
+  [topLevel] -> vcat (map ppr topLevel)
+  malformedStack ->
+    text "Warning: Malformed trace stack (unclosed blocks)."
+      <> text "\n"
+      <> vcat (map ppr (concat (reverse malformedStack)))
+
+runKernelWithTraceIO :: KernelEnv -> InternState -> KernelM a -> IO (Either KernelError a, InternState)
+runKernelWithTraceIO env internSt action = do
+  let initialCtx = emptyKernelCtx env
+      initialSt = emptyKernelState {checkInternState = internSt}
+      (res, finalState) = unKernelM action initialCtx initialSt
+  putStrLn "\n================ KERNEL TRACE ================"
+  putStrLn $ toString (renderKernelTrace finalState)
+  putStrLn "==============================================\n"
+  case res of
+    Left err -> putStrLn $ "❌ Kernel Error: " ++ err
+    Right _ -> putStrLn "✅ Kernel Execution Succeeded."
+  pure (res, checkInternState finalState)
 
 --------------------------------------------------------------------------------
 
 freshFVar :: HCName -> KernelM (FVarId HCName)
 freshFVar baseName = do
   idx <- gets checkNextLocalId
-  modify $ \st -> st {checkNextLocalId = idx + 1}
+  modify' $ \st -> st {checkNextLocalId = idx + 1}
   let freshShape = Num baseName idx
   freshHCName <- withIntern $ internNameVal freshShape
   pure $ FVarId freshHCName
@@ -230,12 +355,10 @@ getDefHints name = do
     Nothing -> pure Opaque
 
 withLocalDecl :: FVarId HCName -> LocalDecl -> KernelM a -> KernelM a
-withLocalDecl fvarId decl k = do
-  KernelM $ local (\ctx -> ctx {checkLocalCtx = (fvarId, decl) : checkLocalCtx ctx}) (unKernelM k)
+withLocalDecl fvarId decl k = local (\ctx -> ctx {checkLocalCtx = (fvarId, decl) : checkLocalCtx ctx}) k
 
 modifyGlobalEnv :: (KernelEnv -> KernelEnv) -> KernelM ()
-modifyGlobalEnv f = do
-  KernelM $ local (\ctx -> ctx {checkEnv = f (checkEnv ctx)}) (pure ())
+modifyGlobalEnv f = local (\ctx -> ctx {checkEnv = f (checkEnv ctx)}) (pure ())
 
 --------------------------------------------------------------------------------
 
@@ -274,26 +397,39 @@ data Value
   deriving (Show)
 
 instance PrettyPrint Closure where
-  ppr (Closure env body) = text "Closure" <> parens (text "local env:" <+> brackets (hcatWithComma (map ppr env)) <+> text "body:" <+> ppr body)
+  ppr (Closure env body) =
+    dim (text "Closure")
+      <> ( dim (char '{')
+             <+> dim (text "env:")
+             <+> brackets (hcatWithComma (map ppr env))
+             <+> dim (text "body:")
+             <+> ppr body
+             <+> dim (char '}')
+         )
 
 instance PrettyPrint Elim where
   ppr elim =
     case elim of
-      EApp arg -> text "EApp" <+> parens (ppr arg)
-      EProj projName idx -> text "EProj" <+> parens (ppr projName <+> int idx)
+      EApp arg ->
+        bold (magenta (text "EApp")) <+> dim (parens (ppr arg))
+      EProj projName idx ->
+        bold (magenta (text "EProj")) <+> dim (parens (green (ppr projName) <> dim (char '.') <> cyan (int idx)))
 
 instance PrettyPrint Head where
   ppr head =
     case head of
-      HFVar fvarId -> text "HFVar" <+> parens (ppr fvarId)
-      HConst name levels -> text "HConst" <+> parens (ppr name <+> brackets (hcatWithComma (map ppr levels)))
-
+      HFVar fvarId -> ppr fvarId
+      HConst name levels ->
+        green (ppr name)
+          <> if null levels
+            then text ""
+            else dim (brackets (hcatWithComma (map ppr levels)))
 instance PrettyPrint Value where
   ppr val =
     case val of
-      VSort lvl -> text "VSort" <+> parens (ppr lvl)
-      VLit lit -> text "VLit" <+> parens (ppr lit)
-      VLam name binderInfo ty body -> text "VLam" <+> parens (ppr name <+> ppr binderInfo <+> ppr ty <+> text "->" <+> ppr body)
-      VPi name binderInfo ty body -> text "VPi" <+> parens (ppr name <+> ppr binderInfo <+> ppr ty <+> text "->" <+> ppr body)
-      VNeutral head spine -> text "VNeutral" <+> parens (ppr head <+> brackets (hcatWithComma (map ppr spine)))
-      VDef name levels spine _ -> text "VDef" <+> parens (ppr name <+> brackets (hcatWithComma (map ppr levels)) <+> brackets (hcatWithComma (map ppr spine)) <+> text "<thunk>")
+      VSort lvl -> yellow (text "VSort") <+> parens (ppr lvl)
+      VLit lit -> cyan (text "VLit") <+> parens (ppr lit)
+      VLam name binderInfo ty body -> magenta (text "VLam") <+> parens (ppBinder binderInfo name ty <+> text "=>" <+> ppr body)
+      VPi name binderInfo ty body -> bold (magenta (text "VPi")) <+> parens (ppBinder binderInfo name ty <+> text "=>" <+> ppr body)
+      VNeutral head spine -> red (text "VNeutral") <+> parens (ppr head <+> ppr spine)
+      VDef name levels spine _ -> blue (text "VDef") <+> parens (ppr name <+> ppr levels <+> ppr spine <+> (dim (text "<thunk>")))

@@ -22,15 +22,15 @@ instance (Hashable n) => Hashable (Name' n) where
 instance (HasName n, PrettyPrint n) => PrettyPrint (Name' n) where
   ppr name =
     case name of
-      Anonymous -> char '_'
+      Anonymous -> dim (char '_')
       Str prefix segment ->
         case getName prefix of
           Anonymous -> text (T.unpack segment)
-          _ -> ppr prefix <> char '.' <> text (T.unpack segment)
+          _ -> ppr prefix <> dim (char '.') <> text (T.unpack segment)
       Num prefix n ->
         case getName prefix of
-          Anonymous -> int n
-          _ -> ppr prefix <> char '.' <> int n
+          Anonymous -> cyan (int n)
+          _ -> ppr prefix <> dim (char '.') <> cyan (int n)
 
 newtype Name = Name {unName :: Name' Name}
   deriving (Show, Eq, Ord)

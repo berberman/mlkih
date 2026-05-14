@@ -17,8 +17,8 @@ data Literal = NatVal Int | StrVal String
 instance PrettyPrint Literal where
   ppr literal =
     case literal of
-      NatVal n -> int n
-      StrVal s -> text (show s)
+      NatVal n -> cyan (int n)
+      StrVal s -> yellow (text (show s))
 
 instance Hashable Literal where
   hashWithSalt salt (NatVal n) = hashWithSalt (hashWithSalt salt (0 :: Int)) n
@@ -63,52 +63,63 @@ data Expr' e l n
 instance (PrettyPrint e, PrettyPrint l, PrettyPrint n) => PrettyPrint (Expr' e l n) where
   ppr expr =
     case expr of
-      BVar idx -> text "#" <> int idx
+      BVar idx -> cyan (char '#' <> int idx)
       FVar fvarId -> ppr fvarId
-      Sort level -> text "Sort" <> parens (ppr level)
+      Sort level -> bold (yellow (text "Sort")) <> dim (parens (ppr level))
       Const name levels ->
-        ppr name
+        green (ppr name)
           <> if null levels
             then text ""
-            else brackets (hcatWithComma (fmap ppr levels))
-      App fn arg -> parens (ppr fn <+> ppr arg)
+            else dim (brackets (hcatWithComma (fmap ppr levels)))
+      App fn arg ->
+        dim (char '(') <> (ppr fn <+> ppr arg) <> dim (char ')')
       Lam name ty body binderInfo ->
-        parens
-          ( text "fun"
-              <+> ppBinder binderInfo name ty
-              <+> text "=>"
-              <+> ppr body
-          )
+        dim (char '(')
+          <> ( magenta (text "λ")
+                 <+> ppBinder binderInfo name ty
+                 <+> magenta (text "=>")
+                 <+> ppr body
+             )
+          <> dim (char ')')
       ForallE name ty body binderInfo ->
-        parens
-          ( text "forall"
-              <+> ppBinder binderInfo name ty
-              <+> text ","
-              <+> ppr body
-          )
+        dim (char '(')
+          <> ( magenta (text "∀")
+                 <+> ppBinder binderInfo name ty
+                 <+> magenta (char ',')
+                 <+> ppr body
+             )
+          <> dim (char ')')
       Lit lit -> ppr lit
       Let name ty value body nondep ->
-        parens
-          ( if nondep
-              then text "have"
-              else
-                text "let"
-                  <+> ppr name
-                  <+> char ':'
-                  <+> ppr ty
-                  <+> text ":="
-                  <+> ppr value
-                  <+> text ";"
-                  <+> ppr body
-          )
-      Proj name idx struct -> ppr name <> char '.' <> int idx <> parens (ppr struct)
+        dim (char '(')
+          <> ( ( if nondep
+                   then magenta (text "have")
+                   else magenta (text "let")
+               )
+                 <+> ppr name
+                 <+> dim (char ':')
+                 <+> ppr ty
+                 <+> magenta (text ":=")
+                 <+> ppr value
+                 <+> magenta (char ';')
+                 <+> ppr body
+             )
+          <> dim (char ')')
+      Proj name idx struct ->
+        green (ppr name) <> dim (char '.') <> cyan (int idx) <> dim (parens (ppr struct))
     where
-      ppBinder binderInfo name ty =
-        case binderInfo of
-          Default -> parens (ppr name <+> char ':' <+> ppr ty)
-          Implicit -> braces (ppr name <+> char ':' <+> ppr ty)
-          StrictImplicit -> braces (braces (ppr name <+> char ':' <+> ppr ty))
-          InstImplicit -> brackets (ppr name <+> char ':' <+> ppr ty)
+
+ppBinder :: (PrettyPrint ty, PrettyPrint name) => BinderInfo -> name -> ty -> Doc
+ppBinder binderInfo name ty =
+  let n = ppr name
+      colon = dim (char ':')
+      t = ppr ty
+      inner = (n <+> colon <+> t)
+   in case binderInfo of
+        Default -> dim (char '(') <> inner <> dim (char ')')
+        Implicit -> dim (char '{') <> inner <> dim (char '}')
+        StrictImplicit -> dim (text "{{") <> inner <> dim (text "}}")
+        InstImplicit -> dim (char '[') <> inner <> dim (char ']')
 
 instance (Hashable e, Hashable l, Hashable n) => Hashable (Expr' e l n) where
   hashWithSalt salt expr =

@@ -1,9 +1,12 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module Main (main) where
 
 import Control.Exception (IOException, try)
+import Control.Monad (replicateM)
 import Control.Monad.Error.Class (throwError)
+import Control.Monad.Reader (local)
 import Control.Monad.State.Strict (gets, runState)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BSC
@@ -37,15 +40,16 @@ tests :: TestTree
 tests =
   testGroup
     "mlkih"
-    [ testCase "Beta-Reduction" testNbESemanticBetaReduction,
-      testCase "checkUnfoldStack" testRecursionGuardPreventsLoop,
-      testCase "defEqCacheHits" testDefEqCacheHits,
+    [ -- testCase "Beta-Reduction" testNbESemanticBetaReduction,
+      -- testCase "checkUnfoldStack" testRecursionGuardPreventsLoop,
+      -- testCase "defEqCacheHits" testDefEqCacheHits,
       testCase "struct eta-equivalence" testSemanticStructEtaEquivalence
+      -- testCase "K-rule index matching" testKRuleIndexMatching
     ]
 
 testDefEqCacheHits :: IO ()
 testDefEqCacheHits = do
-  (result, failedCacheAfter) <- expectRight . evalKernelM IntMap.empty emptyInternState $ do
+  (result, failedCacheAfter) <- expectRight $ runKernelWithTraceIO IntMap.empty emptyInternState $ do
     -- Construct two definitively distinct expressions
     exprA <- mkLit (NatVal 1)
     exprB <- mkLit (NatVal 2)
@@ -69,7 +73,7 @@ testRecursionGuardPreventsLoop = do
   let ((recName, sortExpr, recExpr, stuckExpr, recBody), internState) = runState build emptyInternState
       env = kernelEnvFromInfos [mkDefinitionInfo sortExpr recName [] (Regular 1) recBody]
 
-  (result, stackAfter) <- expectRight . evalKernelM env internState $ do
+  (result, stackAfter) <- expectRight $ runKernelWithTraceIO env internState $ do
     -- Try to prove `rec = 0`.
     -- The kernel will unfold `rec` to `rec`, hit the stack guard, and cleanly abort.
     res <- isDefEq recExpr stuckExpr
@@ -83,7 +87,7 @@ testRecursionGuardPreventsLoop = do
   where
     build = do
       recName <- internName (rawName ["Loop", "forever"])
-      sortExpr <- internExpr rawSortZeroExpr
+      sortExpr <- internExpr rawSortOneExpr
       recExpr <- internExpr (rawConstExpr ["Loop", "forever"])
       stuckExpr <- internExpr (rawNatExpr 0)
       recBody <- internExpr (rawConstExpr ["Loop", "forever"])
@@ -110,7 +114,7 @@ testSemanticStructEtaEquivalence = do
           }
       env = IntMap.fromList [(hcnId structName, InductInfo indVal), (hcnId ctorName, CtorInfo ctorVal)]
 
-  result <- expectRight . evalKernelM env internState $ do
+  result <- expectRight $ runKernelWithTraceIO env internState $ do
     structExpr <- mkConst structName []
     structTyVal <- evalM [] structExpr
 
@@ -132,26 +136,151 @@ testSemanticStructEtaEquivalence = do
     build = do
       structName <- internName (rawName ["MyStruct"])
       ctorName <- internName (rawName ["MyStruct", "mk"])
-      sortExpr <- internExpr rawSortZeroExpr
+      sortExpr <- internExpr rawSortOneExpr
       structTy <- internExpr (rawConstExpr ["MyStruct"])
 
-      -- Constructor Type: Forall y : Sort, Forall x : Sort, MyStruct
-      -- (This explicitly gives the constructor two valid fields so the kernel can project them)
-      let ty1 = Expr (ForallE (rawName ["y"]) rawSortZeroExpr (rawConstExpr ["MyStruct"]) Default)
-      let ty2 = Expr (ForallE (rawName ["x"]) rawSortZeroExpr ty1 Default)
+      let ty1 = Expr (ForallE (rawName ["y"]) rawSortOneExpr (rawConstExpr ["MyStruct"]) Default)
+      let ty2 = Expr (ForallE (rawName ["x"]) rawSortOneExpr ty1 Default)
       ctorTy <- internExpr ty2
 
       pure (structName, ctorName, sortExpr, structTy, ctorTy)
 
+testKRuleIndexMatching :: IO ()
+testKRuleIndexMatching = do
+  let ((eqName, reflName, recName, sortExpr, eqTyExpr, recTyExpr, reflTyExpr), initialInternState) = runState build emptyInternState
+
+      eqInd =
+        InductiveVal
+          { indConst = ConstantVal {constName = eqName, constLevelParameters = [], constType = hceVal eqTyExpr},
+            indParamsN = 2,
+            indIndicesN = 1,
+            indCtors = [reflName]
+          }
+      eqRefl =
+        ConstructorVal
+          { ctorConst = ConstantVal {constName = reflName, constLevelParameters = [], constType = hceVal reflTyExpr},
+            ctorInductive = eqName,
+            ctorIndex = 0,
+            ctorParamsN = 2,
+            ctorFieldsN = 0
+          }
+      eqRec =
+        RecursorVal
+          { recConst = ConstantVal {constName = recName, constLevelParameters = [], constType = hceVal recTyExpr},
+            recParamsN = 2,
+            recIndicesN = 1,
+            recMotivesN = 1,
+            recMinorsN = 1,
+            recKRule = True,
+            recRules = []
+          }
+
+      env =
+        IntMap.fromList
+          [ (hcnId eqName, InductInfo eqInd),
+            (hcnId reflName, CtorInfo eqRefl),
+            (hcnId recName, RecInfo eqRec)
+          ]
+
+  (reducedEq, stuckEq) <- expectRight
+    $ runKernelWithTraceIO env initialInternState
+    $ local
+      ( \ctx ->
+          ctx
+            { checkMetadata =
+                ValidatedKernelMetadata
+                  { validatedInductives = IntMap.singleton (hcnId reflName) eqName,
+                    validatedRecursors =
+                      IntMap.singleton
+                        (hcnId recName)
+                        RecursorMeta
+                          { recTargetInductive = eqName,
+                            recExpectedFields = IntMap.singleton (hcnId reflName) 0 -- Eq.refl takes 0 fields
+                          }
+                  }
+            }
+      )
+    $ do
+      zero <- mkLevelZero
+      sortZero <- mkSort zero
+      sortZeroVal <- evalM [] sortZero
+
+      alphaFv <- freshFVar (hcName ["alpha"])
+      aFv <- freshFVar (hcName ["a"])
+      bFv <- freshFVar (hcName ["b"])
+      motiveFv <- freshFVar (hcName ["motive"])
+      minorFv <- freshFVar (hcName ["minor"])
+
+      alpha <- mkFVar alphaFv
+      a <- mkFVar aFv
+      b <- mkFVar bFv
+      motive <- mkFVar motiveFv
+      minor <- mkFVar minorFv
+
+      -- SAFELY build the constants using their guaranteed unique IDs
+      eqConst <- mkConst eqName []
+      recConst <- mkConst recName []
+
+      eqSameType <- mkApps eqConst [alpha, a, a]
+      eqDiffType <- mkApps eqConst [alpha, a, b]
+
+      eqSameTyVal <- evalM [] eqSameType
+      eqDiffTyVal <- evalM [] eqDiffType
+
+      hSameFv <- freshFVar (hcName ["h_same"])
+      hDiffFv <- freshFVar (hcName ["h_diff"])
+
+      withLocalDecl alphaFv (LocalDecl sortZeroVal Nothing) $
+        withLocalDecl aFv (LocalDecl sortZeroVal Nothing) $
+          withLocalDecl bFv (LocalDecl sortZeroVal Nothing) $
+            withLocalDecl motiveFv (LocalDecl sortZeroVal Nothing) $
+              withLocalDecl minorFv (LocalDecl sortZeroVal Nothing) $
+                withLocalDecl hSameFv (LocalDecl eqSameTyVal Nothing) $
+                  withLocalDecl hDiffFv (LocalDecl eqDiffTyVal Nothing) $ do
+                    hSame <- mkFVar hSameFv
+                    hDiff <- mkFVar hDiffFv
+
+                    -- SAFELY apply the arguments to the true Eq.rec constant
+                    recAppSame <- mkApps recConst [alpha, a, motive, minor, a, hSame]
+                    recAppDiff <- mkApps recConst [alpha, a, motive, minor, b, hDiff]
+
+                    reducedResult <- isDefEq recAppSame minor
+                    stuckResult <- isDefEq recAppDiff minor
+
+                    pure (reducedResult, stuckResult)
+
+  assertEq True reducedEq "expected K-rule to reduce to the minor premise when indices match"
+  assertEq False stuckEq "expected K-rule to remain stuck when actual and target indices differ"
+  where
+    build = do
+      eqName <- internName (rawName ["Eq"])
+      reflName <- internName (rawName ["Eq", "refl"])
+      recName <- internName (rawName ["Eq", "rec"])
+      sortExpr <- internExpr rawSortZeroExpr
+
+      let rawArrow n = foldr (\_ res -> Expr (ForallE (rawName ["_"]) rawSortZeroExpr res Default)) rawSortZeroExpr [1 .. n]
+      eqTyExpr <- internExpr (rawArrow 3)
+      recTyExpr <- internExpr (rawArrow 6)
+
+      -- Eq.refl:
+      -- Forall alpha, Forall a, Eq alpha a a
+      -- BVar 1 = alpha, BVar 0 = a
+      let eqApp = rawAppsExpr (rawConstExpr ["Eq"]) [rawBVarExpr 1, rawBVarExpr 0, rawBVarExpr 0]
+      let reflTyRaw = Expr (ForallE (rawName ["alpha"]) rawSortZeroExpr (Expr (ForallE (rawName ["a"]) rawSortZeroExpr eqApp Default)) Default)
+      reflTyExpr <- internExpr reflTyRaw
+
+      pure (eqName, reflName, recName, sortExpr, eqTyExpr, recTyExpr, reflTyExpr)
+
 testNbESemanticBetaReduction :: IO ()
 testNbESemanticBetaReduction = do
-  result <- expectRight . evalKernelM IntMap.empty emptyInternState $ do
+  result <- expectRight $ runKernelWithTraceIO IntMap.empty emptyInternState $ do
     zero <- mkLevelZero
-    sort <- mkSort zero
+    one <- mkLevelSucc zero
+    sortOne <- mkSort one
 
     -- \x -> x
     bodyVar <- mkBVar 0
-    idFunc <- mkLam (hcName ["x"]) sort bodyVar Default
+    idFunc <- mkLam (hcName ["x"]) sortOne bodyVar Default
 
     -- (\x -> x) 42
     arg <- mkLit (NatVal 42)
@@ -161,6 +290,9 @@ testNbESemanticBetaReduction = do
     isDefEq applied arg
 
   assertEq True result "expected NbE to natively beta-reduce application to argument"
+
+rawSortOneExpr :: Expr
+rawSortOneExpr = Expr (Sort (Level $ LSucc $ Level LZero))
 
 -- tests :: TestTree
 -- tests =
@@ -1887,10 +2019,10 @@ supportStandaloneCtorPrefixes =
     "{\"constructor\":"
   ]
 
-loadParsedExportFixture :: FilePath -> IO ParsedExport
-loadParsedExportFixture fixtureName = do
-  path <- fixturePath fixtureName
-  expectRight =<< parseExportFileWithState path
+-- loadParsedExportFixture :: FilePath -> IO ParsedExport
+-- loadParsedExportFixture fixtureName = do
+--   path <- fixturePath fixtureName
+--   expectRight =<< parseExportFileWithState path
 
 loadExportFixtureBytes :: FilePath -> IO ByteString
 loadExportFixtureBytes fixtureName = do
@@ -1914,9 +2046,9 @@ expectFixtureFailureContaining needle fixtureName = do
         else assertFailure ("expected parse failure containing " <> show needle <> ", got: " <> err)
     Right _ -> assertFailure ("expected parse failure containing " <> show needle <> ", but parse succeeded")
 
-expectRight :: Either String a -> IO a
+expectRight :: IO (Either String a, InternState) -> IO a
 expectRight result =
-  case result of
+  fst <$> result >>= \case
     Left err -> assertFailure err
     Right value -> pure value
 

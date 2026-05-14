@@ -245,7 +245,7 @@ instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (InductiveVal e l) where
               <> text ", indices="
               <> int (indIndicesN indVal)
               <> text ", ctors="
-              <> brackets (hcatWithComma (fmap ppr (indCtors indVal)))
+              <> ppr (indCtors indVal)
               <> text "]"
           )
 
