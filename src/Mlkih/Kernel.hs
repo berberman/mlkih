@@ -51,14 +51,14 @@ insertRaw info = modifyGlobalEnv $ IntMap.insert (hcnId (constantInfoName info))
 typecheckInfo :: ConstantInfo HCExpr HCLevel -> KernelM ()
 typecheckInfo info = do
   tyExpr <- withIntern $ internExprVal $ constType $ constantInfoConst info
-  tyTypeVal <- inferExpr [] tyExpr
+  tyTypeVal <- inferExpr 0 [] tyExpr
   _ <- ensureSort tyTypeVal
   case constantInfoBody info of
     Just valExpr -> do
       valExpr' <- withIntern $ internExprVal valExpr
-      valTypeVal <- inferExpr [] valExpr'
+      valTypeVal <- inferExpr 0 [] valExpr'
       expectedTyVal <- evalM [] tyExpr
-      isTypeOk <- isDefEqValue valTypeVal expectedTyVal
+      isTypeOk <- isDefEqValue 0 valTypeVal expectedTyVal
       if not isTypeOk
         then throwError $ "Type of constant body does not match declared type: " <> show valTypeVal <> " vs " <> show expectedTyVal
         else pure ()

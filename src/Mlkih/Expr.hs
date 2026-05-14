@@ -49,7 +49,7 @@ instance Hashable BinderInfo where
 
 data Expr' e l n
   = BVar Int
-  | FVar (FVarId n)
+  -- | FVar (FVarId n)
   | Sort l
   | Const n [l]
   | App e e
@@ -64,7 +64,7 @@ instance (PrettyPrint e, PrettyPrint l, PrettyPrint n) => PrettyPrint (Expr' e l
   ppr expr =
     case expr of
       BVar idx -> cyan (char '#' <> int idx)
-      FVar fvarId -> ppr fvarId
+      -- FVar fvarId -> ppr fvarId
       Sort level -> bold (yellow (text "Sort")) <> dim (parens (ppr level))
       Const name levels ->
         green (ppr name)
@@ -125,7 +125,7 @@ instance (Hashable e, Hashable l, Hashable n) => Hashable (Expr' e l n) where
   hashWithSalt salt expr =
     case expr of
       BVar idx -> hashWithSalt (hashWithSalt salt (0 :: Int)) idx
-      FVar fvarId -> hashWithSalt (hashWithSalt salt (1 :: Int)) fvarId
+      -- FVar fvarId -> hashWithSalt (hashWithSalt salt (1 :: Int)) fvarId
       Sort level -> hashWithSalt (hashWithSalt salt (2 :: Int)) level
       Const name levels -> hashWithSalt (hashWithSalt (hashWithSalt salt (3 :: Int)) name) levels
       App fn arg -> hashWithSalt (hashWithSalt (hashWithSalt salt (4 :: Int)) fn) arg

@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -11,7 +12,7 @@ import Control.Monad.State.Strict (gets, runState)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.IntMap.Strict as IntMap
-import Data.List (isInfixOf)
+import Data.List (elemIndex, isInfixOf)
 import qualified Data.Text as Text
 import Mlkih.AST
 import Mlkih.Decl
@@ -118,10 +119,10 @@ testSemanticStructEtaEquivalence = do
     structExpr <- mkConst structName []
     structTyVal <- evalM [] structExpr
 
-    let pHint = hcName ["p"]
-    pFVar <- freshFVar pHint
-    pVar <- mkFVar pFVar
-    withLocalDecl pFVar (LocalDecl structTyVal Nothing) $ do
+    let nP = hcName ["p"]
+    let vP = VNeutral (HLvl nP 0) []
+    pVar <- mkBVar 0
+    withLocalDecl 0 (LocalDecl nP structTyVal Nothing) $ do
       -- Create `Struct.mk p.0 p.1`
       ctorExpr <- mkConst ctorName []
       p0 <- mkProj structName 0 pVar
@@ -129,7 +130,7 @@ testSemanticStructEtaEquivalence = do
       etaExpanded <- mkApps ctorExpr [p0, p1]
 
       -- Compare `p` to `Struct.mk p.0 p.1`
-      isDefEq pVar etaExpanded
+      isDefEq' 1 [vP] pVar etaExpanded
 
   assertEq True result "expected structural eta to prove a variable equals its reconstructed projections"
   where
@@ -205,49 +206,58 @@ testKRuleIndexMatching = do
       sortZero <- mkSort zero
       sortZeroVal <- evalM [] sortZero
 
-      alphaFv <- freshFVar (hcName ["alpha"])
-      aFv <- freshFVar (hcName ["a"])
-      bFv <- freshFVar (hcName ["b"])
-      motiveFv <- freshFVar (hcName ["motive"])
-      minorFv <- freshFVar (hcName ["minor"])
-
-      alpha <- mkFVar alphaFv
-      a <- mkFVar aFv
-      b <- mkFVar bFv
-      motive <- mkFVar motiveFv
-      minor <- mkFVar minorFv
-
-      -- SAFELY build the constants using their guaranteed unique IDs
       eqConst <- mkConst eqName []
       recConst <- mkConst recName []
 
-      eqSameType <- mkApps eqConst [alpha, a, a]
-      eqDiffType <- mkApps eqConst [alpha, a, b]
+      let ctxNames = ["alpha", "a", "b", "motive", "minor", "h_same", "h_diff"]
 
-      eqSameTyVal <- evalM [] eqSameType
-      eqDiffTyVal <- evalM [] eqDiffType
+      -- Run the Mini-Elaborator
+      withTestContext
+        ctxNames
+        ( \var -> do
+            -- We can instantly use `var` to build dependent types!
+            alpha <- var "alpha"
+            a <- var "a"
+            b <- var "b"
 
-      hSameFv <- freshFVar (hcName ["h_same"])
-      hDiffFv <- freshFVar (hcName ["h_diff"])
+            eqSameType <- mkApps eqConst [alpha, a, a]
+            eqDiffType <- mkApps eqConst [alpha, a, b]
 
-      withLocalDecl alphaFv (LocalDecl sortZeroVal Nothing) $
-        withLocalDecl aFv (LocalDecl sortZeroVal Nothing) $
-          withLocalDecl bFv (LocalDecl sortZeroVal Nothing) $
-            withLocalDecl motiveFv (LocalDecl sortZeroVal Nothing) $
-              withLocalDecl minorFv (LocalDecl sortZeroVal Nothing) $
-                withLocalDecl hSameFv (LocalDecl eqSameTyVal Nothing) $
-                  withLocalDecl hDiffFv (LocalDecl eqDiffTyVal Nothing) $ do
-                    hSame <- mkFVar hSameFv
-                    hDiff <- mkFVar hDiffFv
+            -- Notice how we can use the empty env [] here because these AST
+            -- nodes only contain constants and BVars, which evalM resolves via depth anyway!
+            -- (If they require actual evaluation of local lets, we'd eval them in the body below).
+            eqSameTyVal <- evalM [] eqSameType
+            eqDiffTyVal <- evalM [] eqDiffType
 
-                    -- SAFELY apply the arguments to the true Eq.rec constant
-                    recAppSame <- mkApps recConst [alpha, a, motive, minor, a, hSame]
-                    recAppDiff <- mkApps recConst [alpha, a, motive, minor, b, hDiff]
+            pure
+              [ ("alpha", sortZeroVal),
+                ("a", sortZeroVal),
+                ("b", sortZeroVal),
+                ("motive", sortZeroVal),
+                ("minor", sortZeroVal),
+                ("h_same", eqSameTyVal),
+                ("h_diff", eqDiffTyVal)
+              ]
+        )
+        $ \depth finalEnv var -> do
+          -- THE ACTUAL TEST BODY
+          -- We just grab the BVars and go. No counting needed!
+          alpha <- var "alpha"
+          a <- var "a"
+          b <- var "b"
+          motive <- var "motive"
+          minor <- var "minor"
+          hSame <- var "h_same"
+          hDiff <- var "h_diff"
 
-                    reducedResult <- isDefEq recAppSame minor
-                    stuckResult <- isDefEq recAppDiff minor
+          recAppSame <- mkApps recConst [alpha, a, motive, minor, a, hSame]
+          recAppDiff <- mkApps recConst [alpha, a, motive, minor, b, hDiff]
 
-                    pure (reducedResult, stuckResult)
+          -- Test equality passing the Depth and Runtime Env!
+          reducedResult <- isDefEq' depth finalEnv recAppSame minor
+          stuckResult <- isDefEq' depth finalEnv recAppDiff minor
+
+          pure (reducedResult, stuckResult)
 
   assertEq True reducedEq "expected K-rule to reduce to the minor premise when indices match"
   assertEq False stuckEq "expected K-rule to remain stuck when actual and target indices differ"
@@ -293,6 +303,34 @@ testNbESemanticBetaReduction = do
 
 rawSortOneExpr :: Expr
 rawSortOneExpr = Expr (Sort (Level $ LSucc $ Level LZero))
+
+withTestContext ::
+  [String] -> -- The exact ordered list of variable names
+  ((String -> KernelM HCExpr) -> KernelM [(String, Value)]) -> -- A function to build the types using the variables
+  (Int -> LocalEnv -> (String -> KernelM HCExpr) -> KernelM a) -> -- The actual test body
+  KernelM a
+withTestContext names buildTypes action = do
+  let totalDepth = length names
+
+  -- 1. The Magic Lookup Function (Automates the Golden Formula!)
+  let var nameStr = case elemIndex nameStr names of
+        Just lvl -> mkBVar (totalDepth - 1 - lvl)
+        Nothing -> throwError $ "Test variable typo: " ++ nameStr
+
+  -- 2. Build the types using the newly available variables
+  typesList <- buildTypes var
+
+  -- 3. Recursively push the context and build the runtime LocalEnv
+  let go [] _ env = action totalDepth env var
+      go ((nameStr, tyVal) : rest) currentDepth env = do
+        let name = hcName [nameStr]
+        let decl = LocalDecl name tyVal Nothing
+        let levelVal = VNeutral (HLvl name currentDepth) []
+
+        withLocalDecl currentDepth decl $
+          go rest (currentDepth + 1) (levelVal : env)
+
+  go typesList 0 []
 
 -- tests :: TestTree
 -- tests =
@@ -2055,10 +2093,6 @@ expectRight result =
 neverCompareArgs :: HCExpr -> HCExpr -> KernelM Bool
 neverCompareArgs _ _ = throwError "unexpected same-head regular pre-unfold comparison"
 
-whnf :: HCExpr -> KernelM HCExpr
-whnf expr = do
-  val <- evalM [] expr
-  quote val
 
 assertEq :: (Eq a, Show a) => a -> a -> String -> IO ()
 assertEq expected actual message =

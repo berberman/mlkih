@@ -13,7 +13,7 @@ module Mlkih.AST
     BinderView (..),
     LetView (..),
     mkBVar,
-    mkFVar,
+    -- mkFVar,
     mkSort,
     mkConst,
     mkApp,
@@ -55,7 +55,6 @@ where
 import Control.Monad (foldM)
 import Control.Monad.State.Strict (MonadState)
 import qualified Data.IntMap.Strict as IntMap
-import Data.List (elemIndex)
 import Mlkih.Expr
 import Mlkih.Intern
 import Mlkih.Level
@@ -125,8 +124,8 @@ mkLevelParam name = withIntern $ internLevelVal (LVar name)
 mkBVar :: (MonadState s m, HasInternState s) => Int -> m HCExpr
 mkBVar idx = withIntern $ internExprVal (BVar idx)
 
-mkFVar :: (MonadState s m, HasInternState s) => FVarId HCName -> m HCExpr
-mkFVar fvarId = withIntern $ internExprVal (FVar fvarId)
+-- mkFVar :: (MonadState s m, HasInternState s) => FVarId HCName -> m HCExpr
+-- mkFVar fvarId = withIntern $ internExprVal (FVar fvarId)
 
 mkSort :: (MonadState s m, HasInternState s) => HCLevel -> m HCExpr
 mkSort level = withIntern $ internExprVal (Sort level)
@@ -319,7 +318,7 @@ instantiateList depth args expr =
           let argToApply = args !! (numArgs - 1 - (idx - depth))
           liftLooseBVars 0 depth argToApply
       | otherwise -> mkBVar (idx - numArgs)
-    FVar _ -> pure expr
+    -- FVar _ -> pure expr
     Sort _ -> pure expr
     Const _ _ -> pure expr
     App fn arg -> do
@@ -357,10 +356,10 @@ abstractList depth fvarIds expr =
     BVar idx
       | idx < depth -> pure expr
       | otherwise -> mkBVar (idx + length fvarIds)
-    FVar fv ->
-      case elemIndex fv fvarIds of
-        Just pos -> mkBVar (depth + pos)
-        Nothing -> pure expr
+    -- FVar fv ->
+    --   case elemIndex fv fvarIds of
+    --     Just pos -> mkBVar (depth + pos)
+    --     Nothing -> pure expr
     Sort _ -> pure expr
     Const _ _ -> pure expr
     App fn arg -> do
@@ -413,7 +412,7 @@ instantiateLevelParamsBy :: (MonadState s m, HasInternState s) => (HCName -> May
 instantiateLevelParamsBy subst expr =
   case hceVal expr of
     BVar _ -> pure expr
-    FVar _ -> pure expr
+    -- FVar _ -> pure expr
     Sort level -> do
       level' <- instantiateLevelParamsLevelBy subst level
       if level' == level then pure expr else mkSort level'
@@ -446,7 +445,7 @@ instantiateLevelParamsExprBy :: (MonadState s m, HasInternState s) => (HCName ->
 instantiateLevelParamsExprBy subst expr =
   case expr of
     BVar idx -> mkBVar idx
-    FVar fvarId -> mkFVar fvarId
+    -- FVar fvarId -> mkFVar fvarId
     Sort level -> mkSort =<< instantiateLevelParamsLevelBy subst level
     Const name levels -> mkConst name =<< traverse (instantiateLevelParamsLevelBy subst) levels
     App fn arg -> do
@@ -499,7 +498,7 @@ liftLooseBVars cutoff delta expr
         BVar idx
           | idx < cutoff -> pure expr
           | otherwise -> mkBVar $ idx + delta
-        FVar _ -> pure expr
+        -- FVar _ -> pure expr
         Sort _ -> pure expr
         Const _ _ -> pure expr
         App fn arg -> do

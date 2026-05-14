@@ -205,9 +205,9 @@ internExpr :: (MonadState InternState m) => Expr -> m HCExpr
 internExpr (Expr val) =
   case val of
     BVar idx -> internExprVal $ BVar idx
-    FVar (FVarId name) -> do
-      name' <- internName name
-      internExprVal $ FVar (FVarId name')
+    -- FVar (FVarId name) -> do
+    --   name' <- internName name
+    --   internExprVal $ FVar (FVarId name')
     Sort level -> do
       level' <- internLevel level
       internExprVal $ Sort level'

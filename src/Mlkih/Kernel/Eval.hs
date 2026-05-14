@@ -21,7 +21,6 @@ evalM env expr = withTraceNode (text "evalM:" <+> ppr expr) $ case hceVal expr o
   BVar idx -> do
     traceMsgM $ text "Bound variable lookup. Index:" <+> int idx
     pure $ env !! idx
-  FVar fv -> pure $ VNeutral (HFVar fv) []
   Sort lvl -> pure $ VSort lvl
   Lit lit -> pure $ VLit lit
   Lam name ty body bi -> do
@@ -45,11 +44,11 @@ evalM env expr = withTraceNode (text "evalM:" <+> ppr expr) $ case hceVal expr o
     traceMsgM $ text "Evaluating App argument"
     argVal <- evalM env arg
     traceMsgM $ text "Applying argument to function"
-    applyElimM fnVal (EApp argVal)
+    applyElimM (length env) fnVal (EApp argVal)
   Proj name idx struct -> do
     traceMsgM $ text "Evaluating Proj structure:" <+> ppr name <+> brackets (int idx)
     structVal <- evalM env struct
-    applyElimM structVal (EProj name idx)
+    applyElimM (length env) structVal (EProj name idx)
   Const name levels -> do
     traceMsgM $ text "Looking up Const:" <+> ppr name
     mInfo <- lookupConstInfo name
@@ -67,8 +66,8 @@ evalM env expr = withTraceNode (text "evalM:" <+> ppr expr) $ case hceVal expr o
         pure $ VNeutral (HConst name levels) []
 
 -- | Push an elimination onto a WHNF Value
-applyElimM :: Value -> Elim -> KernelM Value
-applyElimM val elim = withTraceNode (text "applyElimM:" <+> ppr val <+> text "@" <+> ppr elim) $
+applyElimM :: Int -> Value -> Elim -> KernelM Value
+applyElimM depth val elim = withTraceNode (text "applyElimM" <+> "@" <+> int depth <+> ":" <+> ppr val <+> text "∘" <+> ppr elim) $
   case (val, elim) of
     (VLam _ _ _ (Closure env body), EApp argVal) -> do
       traceMsgM $ text "Beta Reduction: evaluating body with new environment"
@@ -103,8 +102,8 @@ applyElimM val elim = withTraceNode (text "applyElimM:" <+> ppr val <+> text "@"
                       -- Quot.mk takes [alpha, r, a]
                       aVal <- extractAppArgM 0 mkSpine
                       fVal <- extractAppArgM 2 exactArgs
-                      reduced <- applyElimM fVal (EApp aVal)
-                      applyElimsM reduced extraArgs
+                      reduced <- applyElimM depth fVal (EApp aVal)
+                      applyElimsM depth reduced extraArgs
                     _ -> fallback
                 _ -> fallback
         Just (RecInfo recVal) -> do
@@ -154,15 +153,15 @@ applyElimM val elim = withTraceNode (text "applyElimM:" <+> ppr val <+> text "@"
                       rhsExpr <- instantiateLevelParamsExpr subst (recRhs rule)
                       rhsVal <- evalM [] rhsExpr
                       traceMsgM $ text "Applying params, motives, minors, and fields to RHS"
-                      val1 <- applyElimsM rhsVal paramsMotivesMinors
-                      val2 <- applyElimsM val1 fields
-                      applyElimsM val2 extraArgs
+                      val1 <- applyElimsM depth rhsVal paramsMotivesMinors
+                      val2 <- applyElimsM depth val1 fields
+                      applyElimsM depth val2 extraArgs
                     _ -> fallback
                 _ ->
                   if recKRule recVal
                     then do
                       traceMsgM $ text "Attempting K-rule reduction"
-                      majorType <- inferValue normalizedMajor
+                      majorType <- inferValue depth normalizedMajor
                       forcedMajorType <- force majorType
                       targetInductive <- lookupValidatedRecursorTargetInductive recName
                       case forcedMajorType of
@@ -195,13 +194,13 @@ applyElimM val elim = withTraceNode (text "applyElimM:" <+> ppr val <+> text "@"
                                           cIndexVals <- mapM extractArgM cIndices
                                           actualIndexVals <- mapM extractArgM actualIndices
                                           traceMsgM $ text "Checking if constructor's generated indices match major premise indices"
-                                          indicesMatch <- and <$> zipWithM isDefEqValue actualIndexVals cIndexVals
+                                          indicesMatch <- and <$> zipWithM (isDefEqValue depth) actualIndexVals cIndexVals
                                           if indicesMatch
                                             then do
                                               traceMsgM $ text "Indices match. K-rule applies, returning minor premise"
                                               let minorPremise = exactArgs !! (1 + recIndicesN recVal)
                                               case minorPremise of
-                                                EApp v -> applyElimsM v extraArgs
+                                                EApp v -> applyElimsM depth v extraArgs
                                                 _ -> fallback
                                             else do
                                               traceMsgM $ text "Indices did not match. K-rule aborted."
@@ -227,16 +226,16 @@ applyElimM val elim = withTraceNode (text "applyElimM:" <+> ppr val <+> text "@"
       -- To prevent forcing the thunk immediately, we wrap the application in a new thunk
       let newThunk = do
             forcedBody <- thunk
-            applyElimM forcedBody elim
+            applyElimM depth forcedBody elim
       pure $ VDef name levels newSpine newThunk
     _ -> do
       traceMsgM $ text "Ill-typed application detected."
       throwError "Ill-typed application"
 
-applyElimsM :: Value -> Spine -> KernelM Value
-applyElimsM baseVal spine =
+applyElimsM :: Int -> Value -> Spine -> KernelM Value
+applyElimsM depth baseVal spine =
   withTraceNode (text "applyElimsM:" <+> ppr baseVal <+> text "spine length:" <+> text (show $ length spine)) $
-    foldM applyElimM baseVal spine
+    foldM (applyElimM depth) baseVal spine
 
 -- | Force a VDef thunk
 force :: Value -> KernelM Value
@@ -244,8 +243,8 @@ force v = case v of
   VDef n _ _ thunk -> withTraceNode (text "force VDef:" <+> ppr n) $ thunk >>= force
   _ -> pure v
 
-isDefEqValue :: Value -> Value -> KernelM Bool
-isDefEqValue val1 val2 = withTraceNode ("isDefEqValue:" <+> ppr val1 <+> text "=?=" <+> ppr val2) $ do
+isDefEqValue :: Int -> Value -> Value -> KernelM Bool
+isDefEqValue depth val1 val2 = withTraceNode ("isDefEqValue" <+> "@" <+> ppr depth <+> ":" <+> ppr val1 <+> text "=?=" <+> ppr val2) $ do
   case (val1, val2) of
     (VSort l1, VSort l2) -> do
       let eq = l1 == l2 || levelEquiv l1 l2
@@ -256,8 +255,8 @@ isDefEqValue val1 val2 = withTraceNode ("isDefEqValue:" <+> ppr val1 <+> text "=
       traceMsgM $ "Lit equality:" <+> text (show eq)
       pure eq
     _ -> do
-      valType <- inferValue val1
-      typeOfValType <- inferValue valType
+      valType <- inferValue depth val1
+      typeOfValType <- inferValue depth valType
       let isProp = case typeOfValType of
             VSort lvl -> getLevel lvl == LZero
             _ -> False
@@ -270,110 +269,110 @@ isDefEqValue val1 val2 = withTraceNode ("isDefEqValue:" <+> ppr val1 <+> text "=
           case z1 of
             Just u1 -> do
               traceMsgM $ text "Zeta reduced LHS"
-              isDefEqValue u1 val2
+              isDefEqValue depth u1 val2
             Nothing -> do
               z2 <- tryZeta val2
               case z2 of
                 Just u2 -> do
                   traceMsgM $ text "Zeta reduced RHS"
-                  isDefEqValue val1 u2
+                  isDefEqValue depth val1 u2
                 Nothing -> matchCore val1 val2
   where
     tryZeta :: Value -> KernelM (Maybe Value)
-    tryZeta (VNeutral (HFVar f) s) = do
-      mDecl <- lookupLocalValue f
+    tryZeta (VNeutral (HLvl _ lvl) s) = do
+      mDecl <- lookupLocalValue lvl
       case mDecl of
-        Just letVal -> Just <$> applyElimsM letVal s
+        Just letVal -> Just <$> applyElimsM depth letVal s
         Nothing -> pure Nothing
     tryZeta _ = pure Nothing
 
     matchCore :: Value -> Value -> KernelM Bool
     matchCore v1 v2 = case (v1, v2) of
       (VLam n1 _ ty1 clo1, VLam _ _ ty2 clo2) -> do
-        typesEq <- isDefEqValue ty1 ty2
+        typesEq <- isDefEqValue depth ty1 ty2
         if not typesEq
           then pure False
           else do
-            fv <- freshFVar n1
-            let fvVal = VNeutral (HFVar fv) []
-            withLocalDecl fv (LocalDecl ty1 Nothing) $ do
-              body1 <- evalM (fvVal : closureEnv clo1) (closureBody clo1)
-              body2 <- evalM (fvVal : closureEnv clo2) (closureBody clo2)
-              isDefEqValue body1 body2
+            let levelVal = VNeutral (HLvl n1 depth) []
+            let decl = LocalDecl n1 ty1 Nothing
+            withLocalDecl depth decl $ do
+              body1 <- evalM (levelVal : closureEnv clo1) (closureBody clo1)
+              body2 <- evalM (levelVal : closureEnv clo2) (closureBody clo2)
+              isDefEqValue (depth + 1) body1 body2
       (VPi n1 _ ty1 clo1, VPi _ _ ty2 clo2) -> do
-        typesEq <- isDefEqValue ty1 ty2
+        typesEq <- isDefEqValue depth ty1 ty2
         if not typesEq
           then pure False
           else do
-            fv <- freshFVar n1
-            let fvVal = VNeutral (HFVar fv) []
-            withLocalDecl fv (LocalDecl ty1 Nothing) $ do
-              body1 <- evalM (fvVal : closureEnv clo1) (closureBody clo1)
-              body2 <- evalM (fvVal : closureEnv clo2) (closureBody clo2)
-              isDefEqValue body1 body2
+            let levelVal = VNeutral (HLvl n1 depth) []
+            let decl = LocalDecl n1 ty1 Nothing
+            withLocalDecl depth decl $ do
+              body1 <- evalM (levelVal : closureEnv clo1) (closureBody clo1)
+              body2 <- evalM (levelVal : closureEnv clo2) (closureBody clo2)
+              isDefEqValue (depth + 1) body1 body2
       (VNeutral h1 s1, VNeutral h2 s2)
-        | h1 == h2 -> isDefEqSpine s1 s2
+        | h1 == h2 -> isDefEqSpine depth s1 s2
       (VDef n1 _ s1 _, VDef n2 _ s2 _) | n1 == n2 -> do
-        match <- isDefEqSpine s1 s2 `catchError` \_ -> pure False
+        match <- isDefEqSpine depth s1 s2 `catchError` \_ -> pure False
         if match
           then pure True
           else do
-            fv1 <- force v1
-            fv2 <- force v2
-            isDefEqValue fv1 fv2
+            v1' <- force v1
+            v2' <- force v2
+            isDefEqValue depth v1' v2'
       (VDef n1 _ _ thunk1, VDef n2 _ _ thunk2) -> do
         hint1 <- getDefHints n1
         hint2 <- getDefHints n2
         case compare hint1 hint2 of
           LT -> do
-            fv1 <- thunk1
-            isDefEqValue fv1 v2
+            v1' <- thunk1
+            isDefEqValue depth v1' v2
           GT -> do
-            fv2 <- thunk2
-            isDefEqValue v1 fv2
+            v2' <- thunk2
+            isDefEqValue depth v1 v2'
           EQ -> do
             if hint1 == Opaque
               then pure False
               else do
                 withUnfoldingConst n1 $ do
-                  fv1 <- thunk1
+                  v1' <- thunk1
                   withUnfoldingConst n2 $ do
-                    fv2 <- thunk2
-                    isDefEqValue fv1 fv2
+                    v2' <- thunk2
+                    isDefEqValue depth v1' v2'
       (VDef n1 _ _ thunk1, _) -> do
         hint1 <- getDefHints n1
         if hint1 == Opaque
           then pure False
           else do
             withUnfoldingConst n1 $ do
-              fv1 <- thunk1
-              isDefEqValue fv1 v2
+              v1' <- thunk1
+              isDefEqValue depth v1' v2
       (_, VDef n2 _ _ thunk2) -> do
         hint2 <- getDefHints n2
         if hint2 == Opaque
           then pure False
           else do
             withUnfoldingConst n2 $ do
-              fv2 <- thunk2
-              isDefEqValue v1 fv2
-      (VLam n _ ty clo, other) -> checkEta n ty clo other
-      (other, VLam n _ ty clo) -> checkEta n ty clo other
+              v2' <- thunk2
+              isDefEqValue depth v1 v2'
+      (VLam n _ ty clo, other) -> checkEta depth n ty clo other
+      (other, VLam n _ ty clo) -> checkEta depth n ty clo other
       (VNeutral (HConst c1 _) s1, other) -> do
         traceMsgM $ "StructEta: Checking LHS const:" <+> ppr c1
-        checkStructEta c1 s1 other `catchError` \e -> do
+        checkStructEta depth c1 s1 other `catchError` \e -> do
           traceMsgM $ text "LHS checkStructEta threw:" <+> text e
           pure False
       (other, VNeutral (HConst c2 _) s2) -> do
         traceMsgM $ "StructEta: Checking RHS const:" <+> ppr c2
-        checkStructEta c2 s2 other `catchError` \e -> do
+        checkStructEta depth c2 s2 other `catchError` \e -> do
           traceMsgM $ text "RHS checkStructEta threw:" <+> text e
           pure False
       _ -> do
         traceMsgM $ text "matchCore fallback reached False."
         pure False
 
-inferValue :: Value -> KernelM Value
-inferValue val = withTraceNode (text "inferValue:" <+> ppr val) $ case val of
+inferValue :: Int -> Value -> KernelM Value
+inferValue depth val = withTraceNode (text "inferValue" <+> "@" <+> int depth <+> ":" <+> ppr val) $ case val of
   VSort lvl -> VSort <$> mkLevelSucc lvl
   VLit (NatVal _) -> do
     name <- withIntern $ internName $ simpleName "Nat"
@@ -384,26 +383,25 @@ inferValue val = withTraceNode (text "inferValue:" <+> ppr val) $ case val of
     con <- mkConst name []
     evalM [] con
   VPi name _ dom clo -> do
-    domTy <- inferValue dom
-    fv <- freshFVar name
-    let fvVal = VNeutral (HFVar fv) []
-    withLocalDecl fv (LocalDecl dom Nothing) $ do
-      bodyVal <- evalM (fvVal : closureEnv clo) (closureBody clo)
-      bodyTy <- inferValue bodyVal
+    domTy <- inferValue depth dom
+    let levelVal = VNeutral (HLvl name depth) []
+    let decl = LocalDecl name dom Nothing
+    withLocalDecl depth decl $ do
+      bodyVal <- evalM (levelVal : closureEnv clo) (closureBody clo)
+      bodyTy <- inferValue (depth + 1) bodyVal
       case (domTy, bodyTy) of
         (VSort l1, VSort l2) -> VSort <$> (mkLevelIMax l1 l2)
         _ -> throwError "Pi type domain or codomain is not a Sort"
   VLam name bi dom clo -> do
-    fv <- freshFVar name
-    let fvVal = VNeutral (HFVar fv) []
-    withLocalDecl fv (LocalDecl dom Nothing) $ do
-      bodyVal <- evalM (fvVal : closureEnv clo) (closureBody clo)
-      bodyTy <- inferValue bodyVal
-      bodyTyExpr <- quote bodyTy
-      bodyTyAbs <- abstractFVar fv bodyTyExpr
-      pure $ VPi name bi dom (Closure (fvVal : closureEnv clo) bodyTyAbs)
-  VNeutral head spine -> inferHeadApp head spine
-  VDef name lvls spine _ -> inferHeadApp (HConst name lvls) spine
+    let levelVal = VNeutral (HLvl name depth) []
+    let decl = LocalDecl name dom Nothing
+    withLocalDecl depth decl $ do
+      bodyVal <- evalM (levelVal : closureEnv clo) (closureBody clo)
+      bodyTy <- inferValue (depth + 1) bodyVal
+      bodyTyExpr <- quote (depth + 1) bodyTy
+      pure $ VPi name bi dom (Closure (closureEnv clo) bodyTyExpr)
+  VNeutral head spine -> inferHeadApp depth head spine
+  VDef name lvls spine _ -> inferHeadApp depth (HConst name lvls) spine
 
 ensureSort :: Value -> KernelM HCLevel
 ensureSort val = withTraceNode (text "ensureSort:" <+> ppr val) $ do
@@ -427,8 +425,8 @@ ensurePi val = withTraceNode (text "ensurePi:" <+> ppr val) $ do
       traceMsgM $ text "Failed: Value is not a Pi (Forall) type"
       throwError "Expected a Pi (Forall) type"
 
-inferExpr :: LocalEnv -> HCExpr -> KernelM Value
-inferExpr env expr = withTraceNode (text "inferExpr:" <+> ppr expr) $ case hceVal expr of
+inferExpr :: Int -> LocalEnv -> HCExpr -> KernelM Value
+inferExpr depth env expr = withTraceNode (text "inferExpr" <+> "@" <+> int depth <+> ":" <+> ppr expr) $ case hceVal expr of
   Sort lvl -> pure $ VSort lvl
   Lit (NatVal _) -> do
     name <- withIntern $ internName $ simpleName "Nat"
@@ -438,10 +436,13 @@ inferExpr env expr = withTraceNode (text "inferExpr:" <+> ppr expr) $ case hceVa
     name <- withIntern $ internName $ simpleName "String"
     con <- mkConst name []
     evalM [] con
-  FVar fv -> do
-    traceMsgM $ text "Looking up FVar type in local context"
-    lookupLocalType fv
-  BVar _idx -> throwError "Unexpected de Bruijn variable during inference"
+  BVar idx -> do
+    if idx < 0 || idx >= depth
+      then throwError $ "De Bruijn index out of bounds: " ++ show idx
+      else do
+        let lvl = depth - 1 - idx
+        traceMsgM $ text "Looking up type in local context for BVar index:" <+> int idx <+> text "which corresponds to level:" <+> int lvl
+        lookupLocalType lvl
   Const name levels -> do
     traceMsgM $ text "Looking up Const type:" <+> ppr name
     mInfo <- lookupConstInfo name
@@ -453,13 +454,13 @@ inferExpr env expr = withTraceNode (text "inferExpr:" <+> ppr expr) $ case hceVa
       Nothing -> throwError "Unknown constant"
   App fn arg -> do
     traceMsgM $ text "Inferring function type"
-    fnTypeVal <- inferExpr env fn
+    fnTypeVal <- inferExpr depth env fn
     (_, _, domTypeVal, clo) <- ensurePi fnTypeVal
     traceMsgM $ text "Evaluating argument and inferring its type"
     argVal <- evalM env arg
-    argTypeVal <- inferValue argVal
+    argTypeVal <- inferValue depth argVal
     traceMsgM $ text "Checking argument type against domain type"
-    isArgTypeOk <- isDefEqValue argTypeVal domTypeVal
+    isArgTypeOk <- isDefEqValue depth argTypeVal domTypeVal
     if not isArgTypeOk
       then do
         traceMsgM $ text "Type mismatch: Arg type" <+> ppr argTypeVal <+> text "!= Domain type" <+> ppr domTypeVal
@@ -469,49 +470,46 @@ inferExpr env expr = withTraceNode (text "inferExpr:" <+> ppr expr) $ case hceVa
         evalM (argVal : closureEnv clo) (closureBody clo)
   Lam name ty body bi -> do
     traceMsgM $ text "Inferring Lam domain type"
-    domTypeVal <- inferExpr env ty
+    domTypeVal <- inferExpr depth env ty
     _ <- ensureSort domTypeVal
-    fv <- freshFVar name
-    let decl = LocalDecl domTypeVal Nothing
-    traceMsgM $ text "Inferring Lam body type with FVar pushed to context"
-    bodyTypeVal <- withLocalDecl fv decl $ inferExpr ((VNeutral (HFVar fv) []) : env) body
-    -- Reconstruct the VPi closure
-    bodyTypeExpr <- quote bodyTypeVal
-    bodyTypeAbs <- abstractFVar fv bodyTypeExpr
-    pure $ VPi name bi domTypeVal (Closure env bodyTypeAbs)
+    let decl = LocalDecl name domTypeVal Nothing
+    let levelVal = VNeutral (HLvl name depth) []
+    traceMsgM $ text "Inferring Lam body type with HLvl pushed to context"
+    bodyTypeVal <- withLocalDecl depth decl $ inferExpr (depth + 1) (levelVal : env) body
+    bodyTypeExpr <- quote (depth + 1) bodyTypeVal
+    pure $ VPi name bi domTypeVal (Closure env bodyTypeExpr)
   ForallE name ty body _ -> do
     traceMsgM $ text "Inferring Pi domain sort"
-    domTypeVal <- inferExpr env ty
+    domTypeVal <- inferExpr depth env ty
     lvl1 <- ensureSort domTypeVal
-    fv <- freshFVar name
-    traceMsgM $ text "Inferring Pi codomain sort with FVar pushed to context"
-    let fvVal = VNeutral (HFVar fv) []
-    let decl = LocalDecl domTypeVal Nothing
-    bodyTypeVal <- withLocalDecl fv decl $ inferExpr (fvVal : env) body
+    let decl = LocalDecl name domTypeVal Nothing
+    let levelVal = VNeutral (HLvl name depth) []
+    traceMsgM $ text "Inferring Pi codomain sort with HLvl pushed to context"
+    bodyTypeVal <- withLocalDecl depth decl $ inferExpr (depth + 1) (levelVal : env) body
     lvl2 <- ensureSort bodyTypeVal
     traceMsgM $ text "Calculating IMax for Pi universe level"
     imaxLvl <- mkLevelIMax lvl1 lvl2
     pure $ VSort imaxLvl
   Let name ty value body nondep -> do
     traceMsgM $ text "Inferring Let binding type"
-    tyVal <- inferExpr env ty
+    tyVal <- inferExpr depth env ty
     _ <- ensureSort tyVal
     valueVal <- evalM env value
-    valueTypeVal <- inferValue valueVal
+    valueTypeVal <- inferValue depth valueVal
     traceMsgM $ text "Checking value type matches annotated type"
-    isValueTypeOk <- isDefEqValue valueTypeVal tyVal
+    isValueTypeOk <- isDefEqValue depth valueTypeVal tyVal
     if not isValueTypeOk
       then do
         traceMsgM $ text "Type mismatch in Let binding"
         throwError "Let-binding type mismatch"
       else do
         traceMsgM $ text "Inferring Let body type"
-        fv <- freshFVar name
-        let decl = LocalDecl tyVal (if nondep then Nothing else Just valueVal)
-        withLocalDecl fv decl $ inferExpr (VNeutral (HFVar fv) [] : env) body
+        let decl = LocalDecl name tyVal (if nondep then Nothing else Just valueVal)
+        let levelVal = VNeutral (HLvl name depth) []
+        withLocalDecl depth decl $ inferExpr (depth + 1) (levelVal : env) body
   Proj projName fieldIdx structExpr -> do
     traceMsgM $ text "Inferring Proj structure type"
-    structTyVal <- inferExpr env structExpr
+    structTyVal <- inferExpr depth env structExpr
     forcedStructTy <- force structTyVal
     case forcedStructTy of
       VNeutral (HConst indName indLvls) indSpine -> do
@@ -538,7 +536,7 @@ inferExpr env expr = withTraceNode (text "inferExpr:" <+> ppr expr) $ case hceVa
                 tyAfterParams <- foldM instantiatePi ctorTypeVal paramVals
                 structVal <- evalM env structExpr
                 let prevProjs = [0 .. fieldIdx - 1]
-                prevProjVals <- mapM (applyElimM structVal . EProj projName) prevProjs
+                prevProjVals <- mapM (applyElimM depth structVal . EProj projName) prevProjs
                 tyAfterProjs <- foldM instantiatePi tyAfterParams prevProjVals
                 (finalFieldTy, _) <- extractPiDomain tyAfterProjs
                 pure finalFieldTy
@@ -555,17 +553,14 @@ extractAppArgM idx spine = case drop idx spine of
   _ -> throwError "Expected an application elimination at the given index in the spine"
 
 -- | Infer the type of a Head, then apply the spine
-inferHeadApp :: Head -> Spine -> KernelM Value
-inferHeadApp head spine = do
-  let headDoc = case head of
-        HFVar fv -> "Free variable:" <+> ppr fv
-        HConst name lvls -> "Constant:" <+> ppr name <+> "at levels " <+> ppr lvls
-  withTraceNode (text "inferHeadApp:" <+> headDoc) $ do
+inferHeadApp :: Int -> Head -> Spine -> KernelM Value
+inferHeadApp depth head spine = do
+  withTraceNode (text "inferHeadApp:" <+> ppr head) $ do
     -- Get the base type of the Head
     baseType <- case head of
-      HFVar fv -> do
-        ty <- lookupLocalType fv
-        traceMsgM $ text "HFVar base type successfully fetched from context."
+      HLvl _ lvl -> do
+        ty <- lookupLocalType lvl
+        traceMsgM $ text "HLvl base type successfully fetched from context."
         pure ty
       HConst name lvls -> do
         mInfo <- lookupConstInfo name
@@ -580,13 +575,13 @@ inferHeadApp head spine = do
           Nothing -> throwError "Unknown constant"
     let baseVal = VNeutral head []
     -- Fold over the spine in reverse order (since innermost arg is last in the list)
-    (finalType, _) <- foldM applyTypeElimAndVal (baseType, baseVal) (reverse spine)
+    (finalType, _) <- foldM (applyTypeElimAndVal depth) (baseType, baseVal) (reverse spine)
     traceMsgM $ text "Successfully applied spine."
     pure finalType
 
 -- | Step through the type by applying eliminations
-applyTypeElimAndVal :: (Value, Value) -> Elim -> KernelM (Value, Value)
-applyTypeElimAndVal (currentType, currentVal) elim = do
+applyTypeElimAndVal :: Int -> (Value, Value) -> Elim -> KernelM (Value, Value)
+applyTypeElimAndVal depth (currentType, currentVal) elim = do
   typeWhnf <- force currentType
   let typeDoc = case typeWhnf of
         VPi _ _ _ _ -> "VPi (Function)"
@@ -602,7 +597,7 @@ applyTypeElimAndVal (currentType, currentVal) elim = do
     -- We evaluate the Pi's closure using the argument.
     (VPi _ _ _ clo, EApp argVal) -> do
       nextType <- evalM (argVal : closureEnv clo) (closureBody clo)
-      bextVal <- applyElimM currentVal elim
+      bextVal <- applyElimM depth currentVal elim
       pure (nextType, bextVal)
     -- When the term is projected, its type must be the Inductive Type.
     -- We look up the constructor field types.
@@ -627,10 +622,10 @@ applyTypeElimAndVal (currentType, currentVal) elim = do
           paramVals <- mapM extractArgM $ reverse indSpine
           tyAfterParams <- foldM instantiatePi ctorTypeVal paramVals
           let prevProjs = [0 .. fieldIdx - 1]
-          prevProjVals <- mapM (applyElimM currentVal . EProj projName) prevProjs
+          prevProjVals <- mapM (applyElimM depth currentVal . EProj projName) prevProjs
           tyAfterProjs <- foldM instantiatePi tyAfterParams prevProjVals
           (finalFieldTy, _) <- extractPiDomain tyAfterProjs
-          nextVal <- applyElimM currentVal elim
+          nextVal <- applyElimM depth currentVal elim
           pure (finalFieldTy, nextVal)
     _ -> do
       traceMsgM $ text "CRASH: Tried to apply" <+> elimDoc <+> text "to a term of type" <+> typeDoc
@@ -651,10 +646,10 @@ extractPiDomain piVal = do
     _ -> throwError "Expected Pi type to extract domain"
 
 isDefEq :: HCExpr -> HCExpr -> KernelM Bool
-isDefEq = isDefEq' []
+isDefEq = isDefEq' 0 []
 
-isDefEq' :: LocalEnv -> HCExpr -> HCExpr -> KernelM Bool
-isDefEq' env e1 e2 = withTraceNode (text "isDefEq':" <+> ppr e1 <+> text "=?=" <+> ppr e2) $ do
+isDefEq' :: Int -> LocalEnv -> HCExpr -> HCExpr -> KernelM Bool
+isDefEq' depth env e1 e2 = withTraceNode (text "isDefEq':" <+> ppr e1 <+> text "=?=" <+> ppr e2) $ do
   failed <- isFailedExprPair e1 e2
   if failed
     then pure False
@@ -663,12 +658,12 @@ isDefEq' env e1 e2 = withTraceNode (text "isDefEq':" <+> ppr e1 <+> text "=?=" <
       if visited
         then pure True
         else do
-          success <- withVisitedExprPair e1 e2 (isDefEqExprCore env e1 e2)
+          success <- withVisitedExprPair e1 e2 (isDefEqExprCore depth env e1 e2)
           unless success $ recordFailedExprPair e1 e2
           pure success
 
-isDefEqExprCore :: LocalEnv -> HCExpr -> HCExpr -> KernelM Bool
-isDefEqExprCore env expr1 expr2
+isDefEqExprCore :: Int -> LocalEnv -> HCExpr -> HCExpr -> KernelM Bool
+isDefEqExprCore depth env expr1 expr2
   | expr1 == expr2 = do
       traceMsgM $ text "Pointer/structural equality hit"
       pure True
@@ -694,24 +689,20 @@ isDefEqExprCore env expr1 expr2
         else do
           fastSuccess <-
             ( do
-                tEq <- isDefEq' env ty1 ty2
+                tEq <- isDefEq' depth env ty1 ty2
                 if not tEq
                   then pure False
                   else do
-                    vEq <- isDefEq' env v1 v2
+                    vEq <- isDefEq' depth env v1 v2
                     if not vEq
                       then pure False
                       else do
                         -- Everything matches
-                        -- Push a fresh variable to check the bodies.
-                        fv <- freshFVar n1
-                        fvExpr <- mkFVar fv
-                        b1' <- instantiate1 fvExpr b1
-                        b2' <- instantiate1 fvExpr b2
                         tyVal <- evalM env ty1
                         valVal <- evalM env v1
-                        let decl = LocalDecl tyVal (if nd1 then Nothing else Just valVal)
-                        withLocalDecl fv decl $ isDefEq' env b1' b2'
+                        let decl = LocalDecl n1 tyVal (if nd1 then Nothing else Just valVal)
+                        let levelVal = VNeutral (HLvl n1 depth) []
+                        withLocalDecl depth decl $ isDefEq' (depth + 1) (levelVal : env) b1 b2
             )
               `catchError` \_ -> pure False
           if fastSuccess then pure True else fallbackToWHNF
@@ -722,11 +713,11 @@ isDefEqExprCore env expr1 expr2
       -- Try structural equality without forcing WHNF
       fastPathSuccess <-
         ( do
-            fnEq <- isDefEq' env fn1 fn2
+            fnEq <- isDefEq' depth env fn1 fn2
             if not fnEq
               then pure False
               else
-                and <$> zipWithM (isDefEq' env) args1 args2
+                and <$> zipWithM (isDefEq' depth env) args1 args2
         )
           `catchError` \_ -> pure False
       if fastPathSuccess then pure True else fallbackToWHNF
@@ -735,17 +726,14 @@ isDefEqExprCore env expr1 expr2
     bi1 == bi2 = do
       fastSuccess <-
         ( do
-            tyEq <- isDefEq' env ty1 ty2
+            tyEq <- isDefEq' depth env ty1 ty2
             if not tyEq
               then pure False
               else do
-                fv <- freshFVar n1
-                fvExpr <- mkFVar fv
-                b1' <- instantiate1 fvExpr b1
-                b2' <- instantiate1 fvExpr b2
                 tyVal <- evalM env ty1
-                let decl = LocalDecl tyVal Nothing
-                withLocalDecl fv decl $ isDefEq' env b1' b2'
+                let decl = LocalDecl n1 tyVal Nothing
+                let levelVal = VNeutral (HLvl n1 depth) []
+                withLocalDecl depth decl $ isDefEq' (depth + 1) (levelVal : env) b1 b2
         )
           `catchError` \_ -> pure False
       if fastSuccess then pure True else fallbackToWHNF
@@ -754,17 +742,14 @@ isDefEqExprCore env expr1 expr2
     bi1 == bi2 = do
       fastSuccess <-
         ( do
-            tyEq <- isDefEq' env ty1 ty2
+            tyEq <- isDefEq' depth env ty1 ty2
             if not tyEq
               then pure False
               else do
-                fv <- freshFVar n1
-                fvExpr <- mkFVar fv
-                b1' <- instantiate1 fvExpr b1
-                b2' <- instantiate1 fvExpr b2
                 tyVal <- evalM env ty1
-                let decl = LocalDecl tyVal Nothing
-                withLocalDecl fv decl $ isDefEq' env b1' b2'
+                let decl = LocalDecl n1 tyVal Nothing
+                let levelVal = VNeutral (HLvl n1 depth) []
+                withLocalDecl depth decl $ isDefEq' (depth + 1) (levelVal : env) b1 b2
         )
           `catchError` \_ -> pure False
       if fastSuccess then pure True else fallbackToWHNF
@@ -774,28 +759,28 @@ isDefEqExprCore env expr1 expr2
       traceMsgM $ text "Falling back to WHNF comparison"
       val1 <- evalM env expr1
       val2 <- evalM env expr2
-      isDefEqValue val1 val2
+      isDefEqValue depth val1 val2
 
-isDefEqSpine :: Spine -> Spine -> KernelM Bool
-isDefEqSpine s1 s2 = withTraceNode (text "isDefEqSpine") $ do
-  if length s1 /= length s2 then pure False else and <$> zipWithM isDefEqElim s1 s2
+isDefEqSpine :: Int -> Spine -> Spine -> KernelM Bool
+isDefEqSpine depth s1 s2 = withTraceNode (text "isDefEqSpine" <+> "@" <+> ppr depth <+> ":" <+> ppr s1 <+> "=?=" <+> ppr s2) $ do
+  if length s1 /= length s2 then pure False else and <$> zipWithM (isDefEqElim depth) s1 s2
 
-isDefEqElim :: Elim -> Elim -> KernelM Bool
-isDefEqElim (EApp v1) (EApp v2) = isDefEqValue v1 v2
-isDefEqElim (EProj _ i1) (EProj _ i2) = pure (i1 == i2)
-isDefEqElim _ _ = pure False
+isDefEqElim :: Int -> Elim -> Elim -> KernelM Bool
+isDefEqElim depth (EApp v1) (EApp v2) = isDefEqValue depth v1 v2
+isDefEqElim _ (EProj _ i1) (EProj _ i2) = pure (i1 == i2)
+isDefEqElim _ _ _ = pure False
 
-checkEta :: HCName -> Value -> Closure -> Value -> KernelM Bool
-checkEta name ty clo otherVal = withTraceNode ("checkEta") $ do
-  fv <- freshFVar name
-  let fvVal = VNeutral (HFVar fv) []
-  withLocalDecl fv (LocalDecl ty Nothing) $ do
-    body1 <- evalM (fvVal : closureEnv clo) (closureBody clo)
-    body2 <- applyElimM otherVal (EApp fvVal)
-    isDefEqValue body1 body2
+checkEta :: Int -> HCName -> Value -> Closure -> Value -> KernelM Bool
+checkEta depth name ty clo otherVal = withTraceNode (text "checkEta" <+> "@" <+> ppr depth) $ do
+  let levelVal = VNeutral (HLvl name depth) []
+  let decl = LocalDecl name ty Nothing
+  withLocalDecl depth decl $ do
+    body1 <- evalM (levelVal : closureEnv clo) (closureBody clo)
+    body2 <- applyElimM depth otherVal (EApp levelVal)
+    isDefEqValue (depth + 1) body1 body2
 
-checkStructEta :: HCName -> Spine -> Value -> KernelM Bool
-checkStructEta ctorName spine otherVal = withTraceNode (text "checkStructEta for" <+> ppr ctorName) $ do
+checkStructEta :: Int -> HCName -> Spine -> Value -> KernelM Bool
+checkStructEta depth ctorName spine otherVal = withTraceNode (text "checkStructEta" <+> "@" <+> ppr depth <+> ":" <+> ppr ctorName) $ do
   mInfo <- lookupConstInfo ctorName
   case mInfo of
     Just (CtorInfo ctorVal) -> do
@@ -818,8 +803,8 @@ checkStructEta ctorName spine otherVal = withTraceNode (text "checkStructEta for
               let projIndices = [0 .. fieldsN - 1]
                   checkField i expectedVal = do
                     traceMsgM $ text "Checking projection field" <+> ppr i
-                    projVal <- applyElimM otherVal (EProj indName i)
-                    isDefEqValue expectedVal projVal
+                    projVal <- applyElimM depth otherVal (EProj indName i)
+                    isDefEqValue depth expectedVal projVal
               and <$> zipWithM checkField projIndices ctorFieldVals
         _ -> do
           traceMsgM $ text "Not a structure (indices != 0 or ctors != 1)."
@@ -829,40 +814,39 @@ checkStructEta ctorName spine otherVal = withTraceNode (text "checkStructEta for
       pure False
 
 -- | Converts a WHNF Value back into a fully normalized AST
-quote :: Value -> KernelM HCExpr
-quote val = do
+quote :: Int -> Value -> KernelM HCExpr
+quote depth val = withTraceNode (text "quote" <+> "@" <+> ppr depth <+> ":" <+> ppr val) $ do
   v <- force val
   case v of
     VSort lvl -> mkSort lvl
     VLit lit -> mkLit lit
     VLam name bi ty clo -> do
-      tyExpr <- quote ty
-      fv <- freshFVar name
-      let fvVal = VNeutral (HFVar fv) []
-      withLocalDecl fv (LocalDecl ty Nothing) $ do
-        bodyVal <- evalM (fvVal : closureEnv clo) (closureBody clo)
-        bodyExpr <- quote bodyVal
-        body' <- abstractFVar fv bodyExpr
-        mkLam name tyExpr body' bi
+      tyExpr <- quote depth ty
+      let decl = LocalDecl name ty Nothing
+      let levelVal = VNeutral (HLvl name depth) []
+      withLocalDecl depth decl $ do
+        bodyVal <- evalM (levelVal : closureEnv clo) (closureBody clo)
+        bodyExpr <- quote (depth + 1) bodyVal
+        mkLam name tyExpr bodyExpr bi
     VPi name bi ty clo -> do
-      tyExpr <- quote ty
-      fv <- freshFVar name
-      let fvVal = VNeutral (HFVar fv) []
-      withLocalDecl fv (LocalDecl ty Nothing) $ do
-        bodyVal <- evalM (fvVal : closureEnv clo) (closureBody clo)
-        bodyExpr <- quote bodyVal
-        body' <- abstractFVar fv bodyExpr
-        mkForall name tyExpr body' bi
+      tyExpr <- quote depth ty
+      let decl = LocalDecl name ty Nothing
+      let levelVal = VNeutral (HLvl name depth) []
+      withLocalDecl depth decl $ do
+        bodyVal <- evalM (levelVal : closureEnv clo) (closureBody clo)
+        bodyExpr <- quote (depth + 1) bodyVal
+        mkForall name tyExpr bodyExpr bi
     VNeutral head spine -> do
       headExpr <- case head of
-        HFVar fv -> mkFVar fv
+        HLvl _ fv -> mkBVar (depth - 1 - fv)
         HConst name levels -> mkConst name levels
-      foldM quoteElim headExpr (reverse spine)
+      traceMsgM $ text "Constructed head expression:" <+> ppr head
+      foldM (quoteElim depth) headExpr (reverse spine)
     VDef _ _ _ _ -> throwError "Unreachable: VDef remaining after force"
 
-quoteElim :: HCExpr -> Elim -> KernelM HCExpr
-quoteElim headExpr (EApp argVal) = do
-  argExpr <- quote argVal
+quoteElim :: Int -> HCExpr -> Elim -> KernelM HCExpr
+quoteElim depth headExpr (EApp argVal) = do
+  argExpr <- quote depth argVal
   mkApp headExpr argExpr
-quoteElim headExpr (EProj name idx) =
+quoteElim _ headExpr (EProj name idx) =
   mkProj name idx headExpr

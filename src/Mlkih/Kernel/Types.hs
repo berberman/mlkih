@@ -38,13 +38,14 @@ data RecursorMeta = RecursorMeta
   }
 
 data LocalDecl = LocalDecl
-  { localType :: Value,
+  { localName :: HCName,
+    localType :: Value,
     -- | For let-bindings
     localValue :: Maybe Value
   }
   deriving (Show)
 
-type LocalCtx = [(FVarId HCName, LocalDecl)]
+type LocalCtx = IntMap LocalDecl
 
 data KernelCtx = KernelCtx
   { checkEnv :: KernelEnv,
@@ -54,7 +55,6 @@ data KernelCtx = KernelCtx
 
 data KernelState = KernelState
   { checkInternState :: InternState,
-    checkNextLocalId :: !Int,
     checkUnfoldStack :: ![HCName],
     checkVisited :: ![(HCId, HCId)],
     checkFailed :: ![(HCId, HCId)],
@@ -124,10 +124,10 @@ instance Show (KernelM a) where
   show _ = "<thunk>"
 
 emptyKernelState :: KernelState
-emptyKernelState = KernelState {checkInternState = emptyInternState, checkNextLocalId = 0, checkUnfoldStack = [], checkVisited = [], checkFailed = [], checkTraceStack = []}
+emptyKernelState = KernelState {checkInternState = emptyInternState, checkUnfoldStack = [], checkVisited = [], checkFailed = [], checkTraceStack = []}
 
 emptyKernelCtx :: KernelEnv -> KernelCtx
-emptyKernelCtx env = KernelCtx {checkEnv = env, checkLocalCtx = [], checkMetadata = ValidatedKernelMetadata IntMap.empty IntMap.empty}
+emptyKernelCtx env = KernelCtx {checkEnv = env, checkLocalCtx = IntMap.empty, checkMetadata = ValidatedKernelMetadata IntMap.empty IntMap.empty}
 
 -- | Runs the kernel, returning both the result and the final state
 runKernelM :: KernelEnv -> InternState -> KernelM a -> (Either KernelError a, KernelState)
@@ -213,14 +213,6 @@ runKernelWithTraceIO env internSt action = do
 
 --------------------------------------------------------------------------------
 
-freshFVar :: HCName -> KernelM (FVarId HCName)
-freshFVar baseName = do
-  idx <- gets checkNextLocalId
-  modify' $ \st -> st {checkNextLocalId = idx + 1}
-  let freshShape = Num baseName idx
-  freshHCName <- withIntern $ internNameVal freshShape
-  pure $ FVarId freshHCName
-
 isConstOnUnfoldStack :: HCName -> KernelM Bool
 isConstOnUnfoldStack name = elem name <$> gets checkUnfoldStack
 
@@ -264,17 +256,17 @@ isFailedExprPair e1 e2 = elem (orderedPair e1 e2) <$> gets checkFailed
 lookupConstInfo :: HCName -> KernelM (Maybe (ConstantInfo HCExpr HCLevel))
 lookupConstInfo name = asks (IntMap.lookup (hcnId name) . checkEnv)
 
-lookupLocalType :: FVarId HCName -> KernelM Value
-lookupLocalType fv = do
+lookupLocalType :: Int -> KernelM Value
+lookupLocalType lvl = do
   ctx <- asks checkLocalCtx
-  case lookup fv ctx of
+  case IntMap.lookup lvl ctx of
     Just decl -> pure $ localType decl
     Nothing -> throwError "Unbound free variable in local context"
 
-lookupLocalValue :: FVarId HCName -> KernelM (Maybe Value)
-lookupLocalValue fv = do
+lookupLocalValue :: Int -> KernelM (Maybe Value)
+lookupLocalValue lvl = do
   ctx <- asks checkLocalCtx
-  case lookup fv ctx of
+  case IntMap.lookup lvl ctx of
     Just decl -> pure $ localValue decl
     Nothing -> throwError "Unbound free variable in local context"
 
@@ -354,8 +346,8 @@ getDefHints name = do
     Just hints -> pure hints
     Nothing -> pure Opaque
 
-withLocalDecl :: FVarId HCName -> LocalDecl -> KernelM a -> KernelM a
-withLocalDecl fvarId decl k = local (\ctx -> ctx {checkLocalCtx = (fvarId, decl) : checkLocalCtx ctx}) k
+withLocalDecl :: Int -> LocalDecl -> KernelM a -> KernelM a
+withLocalDecl depth decl k = local (\ctx -> ctx {checkLocalCtx = IntMap.insert depth decl (checkLocalCtx ctx)}) k
 
 modifyGlobalEnv :: (KernelEnv -> KernelEnv) -> KernelM ()
 modifyGlobalEnv f = local (\ctx -> ctx {checkEnv = f (checkEnv ctx)}) (pure ())
@@ -374,14 +366,20 @@ data Closure = Closure
 type Spine = [Elim]
 
 data Elim
-  = EApp Value
-  | EProj HCName Int
+  = EApp !Value
+  | EProj !HCName !Int
   deriving (Show)
 
 data Head
-  = HFVar (FVarId HCName)
-  | HConst HCName [HCLevel]
-  deriving (Show, Eq)
+  = -- | De Bruijn level of a local variable. We store the name for pretty-printing and error messages
+    HLvl !HCName !Int
+  | HConst !HCName ![HCLevel]
+  deriving (Show)
+
+instance Eq Head where
+  HLvl _ i1 == HLvl _ i2 = i1 == i2
+  HConst n1 ls1 == HConst n2 ls2 = n1 == n2 && ls1 == ls2
+  _ == _ = False
 
 data Value
   = VSort HCLevel
@@ -418,12 +416,13 @@ instance PrettyPrint Elim where
 instance PrettyPrint Head where
   ppr head =
     case head of
-      HFVar fvarId -> ppr fvarId
+      HLvl name lvl -> ppr name <> text "^" <> int lvl
       HConst name levels ->
         green (ppr name)
           <> if null levels
             then text ""
             else dim (brackets (hcatWithComma (map ppr levels)))
+
 instance PrettyPrint Value where
   ppr val =
     case val of
