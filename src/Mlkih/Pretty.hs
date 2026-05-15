@@ -22,6 +22,7 @@ module Mlkih.Pretty
     cyan,
     bold,
     dim,
+    stripAnsi,
   )
 where
 
@@ -72,3 +73,9 @@ magenta = withANSI "35"
 cyan = withANSI "36"
 bold = withANSI "1"
 dim = withANSI "2"
+
+stripAnsi :: String -> String
+stripAnsi [] = []
+stripAnsi ('\ESC' : '[' : rest) = stripAnsi (dropWhile (/= 'm') rest)
+stripAnsi ('m' : rest) = stripAnsi rest
+stripAnsi (c : rest) = c : stripAnsi rest

@@ -1,5 +1,5 @@
 name = "mlkih-fixtures"
-defaultTargets = ["NatAddSuccFixture", "NatAddAddAddCommFixture"]
+defaultTargets = ["NatAddSuccFixture", "NatAddAddAddCommFixture", "TutorialFixture"]
 
 [[require]]
 name = "lean4export"
@@ -11,3 +11,6 @@ name = "NatAddSuccFixture"
 
 [[lean_lib]]
 name = "NatAddAddAddCommFixture"
+
+[[lean_lib]]
+name = "TutorialFixture"

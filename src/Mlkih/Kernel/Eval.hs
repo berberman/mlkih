@@ -141,8 +141,8 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
                   -- major premise is ctor
                   traceMsgM VMid TEval $ text "Recursor major premise is constructor:" <+> ppr ctorName
                   mRule <-
-                    (Just <$> lookupValidatedRecursorRule recName ctorName) `catchError` \_ -> do
-                      traceMsgM VMid TEval $ text "Failed to find validated recursor rule"
+                    (Just <$> lookupValidatedRecursorRule recName ctorName) `catchError` \err -> do
+                      traceMsgM VMid TEval $ text "Failed to find validated recursor rule:" <+> text err
                       pure Nothing
                   case mRule of
                     Just rule -> do
@@ -233,7 +233,7 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
 applyElimsM :: Int -> Value -> Spine -> KernelM Value
 applyElimsM depth baseVal spine =
   withTraceNode VLow TEval (text "applyElimsM:" <+> ppr baseVal <+> text "spine length:" <+> text (show $ length spine)) $
-    foldM (applyElimM depth) baseVal spine
+    foldM (applyElimM depth) baseVal (reverse spine)
 
 -- | Force a VDef thunk
 force :: Value -> KernelM Value
@@ -449,7 +449,7 @@ ensurePi val = withTraceNode VLow TInfer (text "ensurePi:" <+> ppr val) $ do
 
 inferExpr :: Int -> LocalEnv -> HCExpr -> KernelM Value
 inferExpr depth env expr = withTraceNode VLow TInfer (text "inferExpr" <+> "@" <+> int depth <+> ":" <+> ppr expr) $ case hceVal expr of
-  Sort lvl -> pure $ VSort lvl
+  Sort lvl -> VSort <$> mkLevelSucc lvl
   Lit (NatVal _) -> do
     name <- withIntern $ internName $ simpleName "Nat"
     con <- mkConst name []
@@ -492,8 +492,9 @@ inferExpr depth env expr = withTraceNode VLow TInfer (text "inferExpr" <+> "@" <
         evalM (argVal : closureEnv clo) (closureBody clo)
   Lam name ty body bi -> do
     traceMsgM VMid TInfer $ text "Inferring Lam domain type"
-    domTypeVal <- inferExpr depth env ty
-    _ <- ensureSort domTypeVal
+    tySort <- inferExpr depth env ty
+    _ <- ensureSort tySort
+    domTypeVal <- evalM env ty
     let decl = LocalDecl name domTypeVal Nothing
     let levelVal = VNeutral (HLvl name depth) []
     traceMsgM VMid TInfer $ text "Inferring Lam body type with HLvl pushed to context"
@@ -502,8 +503,10 @@ inferExpr depth env expr = withTraceNode VLow TInfer (text "inferExpr" <+> "@" <
     pure $ VPi name bi domTypeVal (Closure env bodyTypeExpr)
   ForallE name ty body _ -> do
     traceMsgM VMid TInfer $ text "Inferring Pi domain sort"
-    domTypeVal <- inferExpr depth env ty
-    lvl1 <- ensureSort domTypeVal
+    tySort <- inferExpr depth env ty
+    forcedTySort <- force tySort
+    lvl1 <- ensureSort forcedTySort
+    domTypeVal <- evalM env ty
     let decl = LocalDecl name domTypeVal Nothing
     let levelVal = VNeutral (HLvl name depth) []
     traceMsgM VMid TInfer $ text "Inferring Pi codomain sort with HLvl pushed to context"

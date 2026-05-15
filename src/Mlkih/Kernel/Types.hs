@@ -49,19 +49,19 @@ data LocalDecl = LocalDecl
 type LocalCtx = IntMap LocalDecl
 
 data KernelCtx = KernelCtx
-  { checkEnv :: KernelEnv,
-    checkLocalCtx :: LocalCtx,
-    checkMetadata :: ValidatedKernelMetadata
+  { checkLocalCtx :: !LocalCtx,
+    checkMaxVerb :: !Verbosity,
+    checkActiveTags :: ![TraceTag]
   }
 
 data KernelState = KernelState
-  { checkInternState :: InternState,
+  { checkEnv :: !KernelEnv,
+    checkMetadata :: !ValidatedKernelMetadata,
+    checkInternState :: !InternState,
     checkUnfoldStack :: ![HCName],
     checkVisited :: ![(HCId, HCId)],
     checkFailed :: ![(HCId, HCId)],
-    checkTraceStack :: ![[TraceNode]],
-    checkMaxVerb :: !Verbosity,
-    checkActiveTags :: ![TraceTag]
+    checkTraceStack :: ![[TraceNode]]
   }
 
 instance HasInternState KernelState where
@@ -126,24 +126,32 @@ instance MonadFail KernelM where
 instance Show (KernelM a) where
   show _ = "<thunk>"
 
-emptyKernelState :: KernelState
-emptyKernelState =
+emptyKernelState :: KernelEnv -> KernelState
+emptyKernelState env =
   KernelState
-    { checkInternState = emptyInternState,
+    { checkEnv = env,
+      checkMetadata = ValidatedKernelMetadata IntMap.empty IntMap.empty,
+      checkInternState = emptyInternState,
       checkUnfoldStack = [],
       checkVisited = [],
       checkFailed = [],
-      checkTraceStack = [],
+      checkTraceStack = []
+    }
+
+emptyKernelCtx :: KernelCtx
+emptyKernelCtx =
+  KernelCtx
+    { checkLocalCtx = IntMap.empty,
       checkMaxVerb = VSilent,
       checkActiveTags = []
     }
 
-emptyKernelCtx :: KernelEnv -> KernelCtx
-emptyKernelCtx env = KernelCtx {checkEnv = env, checkLocalCtx = IntMap.empty, checkMetadata = ValidatedKernelMetadata IntMap.empty IntMap.empty}
+emptyKernelEnv :: KernelEnv
+emptyKernelEnv = IntMap.empty
 
 -- | Runs the kernel, returning both the result and the final state
 runKernelM :: KernelEnv -> InternState -> KernelM a -> (Either KernelError a, KernelState)
-runKernelM env internSt action = (unKernelM action) (emptyKernelCtx env) (emptyKernelState {checkInternState = internSt})
+runKernelM env internSt action = (unKernelM action) emptyKernelCtx ((emptyKernelState env) {checkInternState = internSt})
 
 -- | Evaluates the kernel, discarding the final state
 evalKernelM :: KernelEnv -> InternState -> KernelM a -> Either KernelError a
@@ -186,7 +194,7 @@ instance PrettyPrint TraceNode where
 
 shouldTrace :: Verbosity -> TraceTag -> KernelM Bool
 shouldTrace v tag = do
-  state <- get
+  state <- ask
   pure $ (v <= checkMaxVerb state) && (tag `elem` checkActiveTags state)
 
 traceMsgM :: (PrettyPrint a) => Verbosity -> TraceTag -> a -> KernelM ()
@@ -237,29 +245,25 @@ renderKernelTrace st = case checkTraceStack st of
       <> vcat (map ppr (concat (reverse malformedStack)))
 
 withVerbosity :: Verbosity -> [TraceTag] -> KernelM a -> KernelM a
-withVerbosity v tags action = do
-  oldVerb <- gets checkMaxVerb
-  oldTags <- gets checkActiveTags
-  modify' $ \s -> s {checkMaxVerb = v, checkActiveTags = tags}
-  res <- action
-  modify' $ \s -> s {checkMaxVerb = oldVerb, checkActiveTags = oldTags}
-  pure res
+withVerbosity v tags action = local (\ctx -> ctx {checkMaxVerb = v, checkActiveTags = tags}) action
 
 withMaxVerbosity :: KernelM a -> KernelM a
 withMaxVerbosity = withVerbosity maxBound [minBound .. maxBound]
 
 runKernelWithTraceIO :: KernelEnv -> InternState -> KernelM a -> IO (Either KernelError a, InternState)
 runKernelWithTraceIO env internSt action = do
-  let initialCtx = emptyKernelCtx env
-      initialSt = emptyKernelState {checkInternState = internSt}
-      (res, finalState) = unKernelM action initialCtx initialSt
-  putStrLn "\n================ KERNEL TRACE ================"
-  putStrLn $ toString (renderKernelTrace finalState)
-  putStrLn "==============================================\n"
-  case res of
+  let (result, finalState) = runKernelM env internSt action
+  printKernelTrace finalState
+  case result of
     Left err -> putStrLn $ "❌ Kernel Error: " ++ err
     Right _ -> putStrLn "✅ Kernel Execution Succeeded."
-  pure (res, checkInternState finalState)
+  pure (result, checkInternState finalState)
+
+printKernelTrace :: KernelState -> IO ()
+printKernelTrace st = do
+  putStrLn "\n================ KERNEL TRACE ================"
+  putStrLn $ toString (renderKernelTrace st)
+  putStrLn "==============================================\n"
 
 --------------------------------------------------------------------------------
 
@@ -306,7 +310,7 @@ isFailedExprPair e1 e2 = elem (orderedPair e1 e2) <$> gets checkFailed
 --------------------------------------------------------------------------------
 
 lookupConstInfo :: HCName -> KernelM (Maybe (ConstantInfo HCExpr HCLevel))
-lookupConstInfo name = asks (IntMap.lookup (hcnId name) . checkEnv)
+lookupConstInfo name = gets (IntMap.lookup (hcnId name) . checkEnv)
 
 lookupLocalType :: Int -> KernelM Value
 lookupLocalType lvl = do
@@ -324,9 +328,17 @@ lookupLocalValue lvl = do
 
 --------------------------------------------------------------------------------
 
+constHasBody :: HCName -> KernelM Bool
+constHasBody name = maybe False constantInfoHasBody <$> lookupConstInfo name
+
+constIsDeltaUnfoldable :: HCName -> KernelM Bool
+constIsDeltaUnfoldable name = maybe False constantInfoIsDeltaUnfoldable <$> lookupConstInfo name
+
+--------------------------------------------------------------------------------
+
 lookupValidatedConstructor :: HCName -> KernelM (ConstructorVal HCExpr HCLevel)
 lookupValidatedConstructor ctorName = do
-  metadata <- asks checkMetadata
+  metadata <- gets checkMetadata
   case IntMap.lookup (hcnId ctorName) (validatedInductives metadata) of
     Just indName -> do
       mInfo <- lookupConstInfo indName
@@ -337,7 +349,7 @@ lookupValidatedConstructor ctorName = do
 
 lookupValidatedRecursorRule :: HCName -> HCName -> KernelM (RecursorRule HCExpr HCLevel)
 lookupValidatedRecursorRule recName majorCtorName = do
-  metadata <- asks checkMetadata
+  metadata <- gets checkMetadata
   recMeta <- case IntMap.lookup (hcnId recName) (validatedRecursors metadata) of
     Just meta -> pure meta
     Nothing -> throwError $ "Recursor not validated: " <> show recName
@@ -356,7 +368,7 @@ lookupValidatedRecursorRule recName majorCtorName = do
 
 lookupValidatedRecursorTargetInductive :: HCName -> KernelM HCName
 lookupValidatedRecursorTargetInductive recName = do
-  metadata <- asks checkMetadata
+  metadata <- gets checkMetadata
   recMeta <- case IntMap.lookup (hcnId recName) (validatedRecursors metadata) of
     Just meta -> pure meta
     Nothing -> throwError $ "Recursor not validated: " <> show recName
@@ -393,7 +405,7 @@ getMajorInduct typeExpr majorIdx = go majorIdx typeExpr
 
 getDefHints :: HCName -> KernelM ReducibilityHints
 getDefHints name = do
-  mInfo <- asks (IntMap.lookup (hcnId name) . checkEnv)
+  mInfo <- gets (IntMap.lookup (hcnId name) . checkEnv)
   case mInfo >>= constantInfoDeltaUnfoldability of
     Just hints -> pure hints
     Nothing -> pure Opaque
@@ -402,7 +414,7 @@ withLocalDecl :: Int -> LocalDecl -> KernelM a -> KernelM a
 withLocalDecl depth decl k = local (\ctx -> ctx {checkLocalCtx = IntMap.insert depth decl (checkLocalCtx ctx)}) k
 
 modifyGlobalEnv :: (KernelEnv -> KernelEnv) -> KernelM ()
-modifyGlobalEnv f = local (\ctx -> ctx {checkEnv = f (checkEnv ctx)}) (pure ())
+modifyGlobalEnv f = modify' $ \s -> s {checkEnv = f (checkEnv s)}
 
 --------------------------------------------------------------------------------
 

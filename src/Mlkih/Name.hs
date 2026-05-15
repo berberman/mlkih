@@ -32,6 +32,18 @@ instance (HasName n, PrettyPrint n) => PrettyPrint (Name' n) where
           Anonymous -> cyan (int n)
           _ -> ppr prefix <> dim (char '.') <> cyan (int n)
 
+nameToString :: (HasName a) => a -> String
+nameToString n = case getName n of
+  Anonymous -> "_"
+  Str prefix segment ->
+    case getName prefix of
+      Anonymous -> T.unpack segment
+      _ -> nameToString prefix ++ "." ++ T.unpack segment
+  Num prefix num ->
+    case getName prefix of
+      Anonymous -> show num
+      _ -> nameToString prefix ++ "." ++ show num
+
 newtype Name = Name {unName :: Name' Name}
   deriving (Show, Eq, Ord)
 
