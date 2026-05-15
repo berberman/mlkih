@@ -7,6 +7,7 @@
 
 module Mlkih.Kernel.Types where
 
+import Control.Monad (when)
 import Control.Monad.Except
 import Control.Monad.Reader
 import Control.Monad.State.Strict
@@ -58,7 +59,9 @@ data KernelState = KernelState
     checkUnfoldStack :: ![HCName],
     checkVisited :: ![(HCId, HCId)],
     checkFailed :: ![(HCId, HCId)],
-    checkTraceStack :: ![[TraceNode]]
+    checkTraceStack :: ![[TraceNode]],
+    checkMaxVerb :: !Verbosity,
+    checkActiveTags :: ![TraceTag]
   }
 
 instance HasInternState KernelState where
@@ -124,7 +127,16 @@ instance Show (KernelM a) where
   show _ = "<thunk>"
 
 emptyKernelState :: KernelState
-emptyKernelState = KernelState {checkInternState = emptyInternState, checkUnfoldStack = [], checkVisited = [], checkFailed = [], checkTraceStack = []}
+emptyKernelState =
+  KernelState
+    { checkInternState = emptyInternState,
+      checkUnfoldStack = [],
+      checkVisited = [],
+      checkFailed = [],
+      checkTraceStack = [],
+      checkMaxVerb = VSilent,
+      checkActiveTags = []
+    }
 
 emptyKernelCtx :: KernelEnv -> KernelCtx
 emptyKernelCtx env = KernelCtx {checkEnv = env, checkLocalCtx = IntMap.empty, checkMetadata = ValidatedKernelMetadata IntMap.empty IntMap.empty}
@@ -150,44 +162,70 @@ data TraceNode
   | TraceBlock Doc [TraceNode]
   | TraceError Doc
 
+data Verbosity
+  = VSilent
+  | VLow
+  | VMid
+  | VHigh
+  deriving (Show, Eq, Ord, Enum, Bounded)
+
+data TraceTag
+  = TEval
+  | TInfer
+  | TDefEq
+  | TEta
+  | TQuote
+  | TMisc
+  deriving (Show, Eq, Ord, Enum, Bounded)
+
 instance PrettyPrint TraceNode where
   ppr (TraceMessage d) = green (text "⊢") <+> d
   ppr (TraceError d) = bold (red (text "✗" <+> d))
   ppr (TraceBlock name children) =
     vcat ((bold (blue (text "▼" <+> name))) : map (nest 2 . ppr) children)
 
-traceMsgM :: (PrettyPrint a) => a -> KernelM ()
-traceMsgM item = modify' $ \s ->
-  case checkTraceStack s of
-    (currentLevel : rest) -> s {checkTraceStack = (currentLevel <> [TraceMessage (ppr item)]) : rest}
-    [] -> s {checkTraceStack = [[TraceMessage (ppr item)]]}
+shouldTrace :: Verbosity -> TraceTag -> KernelM Bool
+shouldTrace v tag = do
+  state <- get
+  pure $ (v <= checkMaxVerb state) && (tag `elem` checkActiveTags state)
 
-withTraceNode :: Doc -> KernelM a -> KernelM a
-withTraceNode blockDoc action = do
-  -- Push empty level
-  modify' $ \s -> s {checkTraceStack = [] : checkTraceStack s}
-
-  -- Run action catching errors
-  res <-
-    catchError
-      action
-      ( \err -> do
-          -- If it fails, append the error to the trace structurally
-          modify' $ \s -> case checkTraceStack s of
-            (lvl : rest) -> s {checkTraceStack = (lvl ++ [TraceError (text err)]) : rest}
-            [] -> s
-          throwError err
-      )
-
-  -- Pop level and wrap in Block
-  modify' $ \s ->
+traceMsgM :: (PrettyPrint a) => Verbosity -> TraceTag -> a -> KernelM ()
+traceMsgM v tag item = do
+  active <- shouldTrace v tag
+  when active $ modify' $ \s ->
     case checkTraceStack s of
-      (completedLevel : parentLevel : rest) ->
-        let block = TraceBlock blockDoc completedLevel
-         in s {checkTraceStack = (parentLevel ++ [block]) : rest}
-      _ -> s
+      (currentLevel : rest) -> s {checkTraceStack = (currentLevel ++ [TraceMessage (ppr item)]) : rest}
+      [] -> s {checkTraceStack = [[TraceMessage (ppr item)]]}
 
-  pure res
+withTraceNode :: Verbosity -> TraceTag -> Doc -> KernelM a -> KernelM a
+withTraceNode v tag blockDoc action = do
+  active <- shouldTrace v tag
+  if not active
+    then action
+    else do
+      -- Push empty level
+      modify' $ \s -> s {checkTraceStack = [] : checkTraceStack s}
+
+      -- Run action catching errors
+      res <-
+        catchError
+          action
+          ( \err -> do
+              modify' $ \s -> case checkTraceStack s of
+                (lvl : rest) -> s {checkTraceStack = (lvl ++ [TraceError (text err)]) : rest}
+                [] -> s
+              throwError err
+          )
+
+      -- Pop level and wrap in Block
+      modify' $ \s ->
+        case checkTraceStack s of
+          (completedLevel : parentLevel : rest) ->
+            let block = TraceBlock blockDoc completedLevel
+             in s {checkTraceStack = (parentLevel ++ [block]) : rest}
+          _ -> s
+
+      pure res
 
 renderKernelTrace :: KernelState -> Doc
 renderKernelTrace st = case checkTraceStack st of
@@ -197,6 +235,18 @@ renderKernelTrace st = case checkTraceStack st of
     text "Warning: Malformed trace stack (unclosed blocks)."
       <> text "\n"
       <> vcat (map ppr (concat (reverse malformedStack)))
+
+withVerbosity :: Verbosity -> [TraceTag] -> KernelM a -> KernelM a
+withVerbosity v tags action = do
+  oldVerb <- gets checkMaxVerb
+  oldTags <- gets checkActiveTags
+  modify' $ \s -> s {checkMaxVerb = v, checkActiveTags = tags}
+  res <- action
+  modify' $ \s -> s {checkMaxVerb = oldVerb, checkActiveTags = oldTags}
+  pure res
+
+withMaxVerbosity :: KernelM a -> KernelM a
+withMaxVerbosity = withVerbosity maxBound [minBound .. maxBound]
 
 runKernelWithTraceIO :: KernelEnv -> InternState -> KernelM a -> IO (Either KernelError a, InternState)
 runKernelWithTraceIO env internSt action = do

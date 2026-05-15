@@ -41,7 +41,8 @@ tests :: TestTree
 tests =
   testGroup
     "mlkih"
-    [ -- testCase "Beta-Reduction" testNbESemanticBetaReduction,
+    [ 
+      -- testCase "Beta-Reduction" testNbESemanticBetaReduction,
       -- testCase "checkUnfoldStack" testRecursionGuardPreventsLoop,
       -- testCase "defEqCacheHits" testDefEqCacheHits,
       testCase "struct eta-equivalence" testSemanticStructEtaEquivalence
@@ -50,7 +51,7 @@ tests =
 
 testDefEqCacheHits :: IO ()
 testDefEqCacheHits = do
-  (result, failedCacheAfter) <- expectRight $ runKernelWithTraceIO IntMap.empty emptyInternState $ do
+  (result, failedCacheAfter) <- expectKernelSuccessVerbose IntMap.empty $ do
     -- Construct two definitively distinct expressions
     exprA <- mkLit (NatVal 1)
     exprB <- mkLit (NatVal 2)
@@ -74,7 +75,7 @@ testRecursionGuardPreventsLoop = do
   let ((recName, sortExpr, recExpr, stuckExpr, recBody), internState) = runState build emptyInternState
       env = kernelEnvFromInfos [mkDefinitionInfo sortExpr recName [] (Regular 1) recBody]
 
-  (result, stackAfter) <- expectRight $ runKernelWithTraceIO env internState $ do
+  (result, stackAfter) <- expectKernelSuccessVerbose env $ do
     -- Try to prove `rec = 0`.
     -- The kernel will unfold `rec` to `rec`, hit the stack guard, and cleanly abort.
     res <- isDefEq recExpr stuckExpr
@@ -115,7 +116,7 @@ testSemanticStructEtaEquivalence = do
           }
       env = IntMap.fromList [(hcnId structName, InductInfo indVal), (hcnId ctorName, CtorInfo ctorVal)]
 
-  result <- expectRight $ runKernelWithTraceIO env internState $ do
+  result <- expectKernelSuccessVerbose env $ do
     structExpr <- mkConst structName []
     structTyVal <- evalM [] structExpr
 
@@ -204,44 +205,31 @@ testKRuleIndexMatching = do
     $ do
       zero <- mkLevelZero
       sortZero <- mkSort zero
-      sortZeroVal <- evalM [] sortZero
 
       eqConst <- mkConst eqName []
       recConst <- mkConst recName []
 
       let ctxNames = ["alpha", "a", "b", "motive", "minor", "h_same", "h_diff"]
 
-      -- Run the Mini-Elaborator
       withTestContext
         ctxNames
         ( \var -> do
-            -- We can instantly use `var` to build dependent types!
             alpha <- var "alpha"
             a <- var "a"
             b <- var "b"
-
             eqSameType <- mkApps eqConst [alpha, a, a]
             eqDiffType <- mkApps eqConst [alpha, a, b]
-
-            -- Notice how we can use the empty env [] here because these AST
-            -- nodes only contain constants and BVars, which evalM resolves via depth anyway!
-            -- (If they require actual evaluation of local lets, we'd eval them in the body below).
-            eqSameTyVal <- evalM [] eqSameType
-            eqDiffTyVal <- evalM [] eqDiffType
-
             pure
-              [ ("alpha", sortZeroVal),
-                ("a", sortZeroVal),
-                ("b", sortZeroVal),
-                ("motive", sortZeroVal),
-                ("minor", sortZeroVal),
-                ("h_same", eqSameTyVal),
-                ("h_diff", eqDiffTyVal)
+              [ ("alpha", sortZero),
+                ("a", sortZero),
+                ("b", sortZero),
+                ("motive", sortZero),
+                ("minor", sortZero),
+                ("h_same", eqSameType),
+                ("h_diff", eqDiffType)
               ]
         )
         $ \depth finalEnv var -> do
-          -- THE ACTUAL TEST BODY
-          -- We just grab the BVars and go. No counting needed!
           alpha <- var "alpha"
           a <- var "a"
           b <- var "b"
@@ -252,8 +240,6 @@ testKRuleIndexMatching = do
 
           recAppSame <- mkApps recConst [alpha, a, motive, minor, a, hSame]
           recAppDiff <- mkApps recConst [alpha, a, motive, minor, b, hDiff]
-
-          -- Test equality passing the Depth and Runtime Env!
           reducedResult <- isDefEq' depth finalEnv recAppSame minor
           stuckResult <- isDefEq' depth finalEnv recAppDiff minor
 
@@ -281,9 +267,13 @@ testKRuleIndexMatching = do
 
       pure (eqName, reflName, recName, sortExpr, eqTyExpr, recTyExpr, reflTyExpr)
 
+expectKernelSuccessVerbose :: KernelEnv -> KernelM a -> IO a
+expectKernelSuccessVerbose env action = do
+  expectRight $ runKernelWithTraceIO env emptyInternState $ withMaxVerbosity action
+
 testNbESemanticBetaReduction :: IO ()
 testNbESemanticBetaReduction = do
-  result <- expectRight $ runKernelWithTraceIO IntMap.empty emptyInternState $ do
+  result <- expectKernelSuccessVerbose IntMap.empty $ do
     zero <- mkLevelZero
     one <- mkLevelSucc zero
     sortOne <- mkSort one
@@ -305,30 +295,29 @@ rawSortOneExpr :: Expr
 rawSortOneExpr = Expr (Sort (Level $ LSucc $ Level LZero))
 
 withTestContext ::
-  [String] -> -- The exact ordered list of variable names
-  ((String -> KernelM HCExpr) -> KernelM [(String, Value)]) -> -- A function to build the types using the variables
-  (Int -> LocalEnv -> (String -> KernelM HCExpr) -> KernelM a) -> -- The actual test body
+  [String] ->
+  ((String -> KernelM HCExpr) -> KernelM [(String, HCExpr)]) ->
+  (Int -> LocalEnv -> (String -> KernelM HCExpr) -> KernelM a) ->
   KernelM a
 withTestContext names buildTypes action = do
   let totalDepth = length names
 
-  -- 1. The Magic Lookup Function (Automates the Golden Formula!)
+  -- e.g., ["alpha", "a"] -> [vA^1, vAlpha^0]
+  let finalEnv = reverse [VNeutral (HLvl (hcName [n]) lvl) [] | (n, lvl) <- zip names [0 ..]]
+
   let var nameStr = case elemIndex nameStr names of
         Just lvl -> mkBVar (totalDepth - 1 - lvl)
         Nothing -> throwError $ "Test variable typo: " ++ nameStr
+  typesList <- withVerbosity VSilent [] $ buildTypes var
 
-  -- 2. Build the types using the newly available variables
-  typesList <- buildTypes var
-
-  -- 3. Recursively push the context and build the runtime LocalEnv
-  let go [] _ env = action totalDepth env var
-      go ((nameStr, tyVal) : rest) currentDepth env = do
+  let go [] _ env = withMaxVerbosity $ action totalDepth env var
+      go ((nameStr, tyExpr) : rest) currentDepth env = do
+        tyVal <- evalM finalEnv tyExpr
         let name = hcName [nameStr]
         let decl = LocalDecl name tyVal Nothing
-        let levelVal = VNeutral (HLvl name currentDepth) []
-
         withLocalDecl currentDepth decl $
-          go rest (currentDepth + 1) (levelVal : env)
+          let levelVal = VNeutral (HLvl name currentDepth) []
+           in go rest (currentDepth + 1) (levelVal : env)
 
   go typesList 0 []
 
@@ -2092,7 +2081,6 @@ expectRight result =
 
 neverCompareArgs :: HCExpr -> HCExpr -> KernelM Bool
 neverCompareArgs _ _ = throwError "unexpected same-head regular pre-unfold comparison"
-
 
 assertEq :: (Eq a, Show a) => a -> a -> String -> IO ()
 assertEq expected actual message =
