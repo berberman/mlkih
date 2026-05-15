@@ -270,7 +270,9 @@ withUnfoldingConst :: HCName -> KernelM Bool -> KernelM Bool
 withUnfoldingConst name action = do
   seen <- isConstOnUnfoldStack name
   if seen
-    then pure False
+    then do
+      traceMsgM VLow TDefEq $ text "Already unfolding" <+> ppr name <+> text "- skipping and returning False."
+      pure False
     else do
       modify' (\s -> s {checkUnfoldStack = name : checkUnfoldStack s})
       res <- action
@@ -466,7 +468,7 @@ instance PrettyPrint Elim where
 instance PrettyPrint Head where
   ppr head =
     case head of
-      HLvl name lvl -> ppr name <> text "^" <> int lvl
+      HLvl name lvl -> cyan $ ppr name <> text "^" <> int lvl
       HConst name levels ->
         green (ppr name)
           <> if null levels

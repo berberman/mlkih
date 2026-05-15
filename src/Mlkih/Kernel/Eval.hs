@@ -17,53 +17,59 @@ import Mlkih.Pretty
 --------------------------------------------------------------------------------
 
 evalM :: LocalEnv -> HCExpr -> KernelM Value
-evalM env expr = withTraceNode VLow TDefEq (text "evalM:" <+> ppr expr) $ case hceVal expr of
-  BVar idx -> do
-    traceMsgM VMid TDefEq $ text "Bound variable lookup. Index:" <+> int idx
-    pure $ env !! idx
-  Sort lvl -> pure $ VSort lvl
-  Lit lit -> pure $ VLit lit
-  Lam name ty body bi -> do
-    traceMsgM VMid TDefEq $ text "Evaluating Lam domain:" <+> ppr name
-    tyVal <- evalM env ty
-    traceMsgM VMid TDefEq $ text "Suspending Lam body in closure"
-    pure $ VLam name bi tyVal (Closure env body)
-  ForallE name ty body bi -> do
-    traceMsgM VMid TDefEq $ text "Evaluating Pi domain:" <+> ppr name
-    tyVal <- evalM env ty
-    traceMsgM VMid TDefEq $ text "Suspending Pi body in closure"
-    pure $ VPi name bi tyVal (Closure env body)
-  Let name _ val body _nondep -> do
-    traceMsgM VMid TDefEq $ text "Evaluating Let value:" <+> ppr name
-    valVal <- evalM env val
-    traceMsgM VMid TDefEq $ text "Evaluating Let body with value in environment"
-    evalM (valVal : env) body
-  App fn arg -> do
-    traceMsgM VMid TDefEq $ text "Evaluating App function"
-    fnVal <- evalM env fn
-    traceMsgM VMid TDefEq $ text "Evaluating App argument"
-    argVal <- evalM env arg
-    traceMsgM VMid TDefEq $ text "Applying argument to function"
-    applyElimM (length env) fnVal (EApp argVal)
-  Proj name idx struct -> do
-    traceMsgM VMid TDefEq $ text "Evaluating Proj structure:" <+> ppr name <+> brackets (int idx)
-    structVal <- evalM env struct
-    applyElimM (length env) structVal (EProj name idx)
-  Const name levels -> do
-    traceMsgM VMid TDefEq $ text "Looking up Const:" <+> ppr name
-    mInfo <- lookupConstInfo name
-    case mInfo of
-      Just (DefnInfo def) -> do
-        traceMsgM VMid TDefEq $ text "Const is Defn. Instantiating levels and creating lazy thunk."
-        let subst = zip (constLevelParameters (defConst def)) levels
-        -- Eagerly substitute universes
-        instantiatedBody <- instantiateLevelParamsExpr subst (defValue def)
-        -- Suspend the evaluation of the body
-        let lazyThunk = evalM [] instantiatedBody
-        pure $ VDef name levels [] lazyThunk
-      _ -> do
-        traceMsgM VMid TDefEq $ text "Const is not a Defn. Returning stuck Neutral."
-        pure $ VNeutral (HConst name levels) []
+evalM env expr = withTraceNode VLow TEval (text "evalM:" <+> ppr expr) $ do
+  traceMsgM VHigh TEval $ text "LocalEnv is" <+> ppr env
+  case hceVal expr of
+    BVar idx -> do
+      traceMsgM VMid TEval $ text "Looking up bound variable"
+      pure $ env !! idx
+    Sort lvl -> do
+      traceMsgM VMid TEval $ text "Returning Sort:" <+> ppr lvl
+      pure $ VSort lvl
+    Lit lit -> do
+      traceMsgM VMid TEval $ text "Returning literal:" <+> ppr lit
+      pure $ VLit lit
+    Lam name ty body bi -> do
+      traceMsgM VMid TEval $ text "Evaluating Lam domain type" <+> ppr name
+      tyVal <- evalM env ty
+      traceMsgM VMid TEval $ text "Building closure for Lam body with environment"
+      pure $ VLam name bi tyVal (Closure env body)
+    ForallE name ty body bi -> do
+      traceMsgM VMid TEval $ text "Evaluating Pi domain type:" <+> ppr name
+      tyVal <- evalM env ty
+      traceMsgM VMid TEval $ text "Building closure for Pi body with environment"
+      pure $ VPi name bi tyVal (Closure env body)
+    Let name _ val body _nondep -> do
+      traceMsgM VMid TEval $ text "Evaluating Let value:" <+> ppr name
+      valVal <- evalM env val
+      traceMsgM VMid TEval $ text "Evaluating Let body with value in environment"
+      evalM (valVal : env) body
+    App fn arg -> do
+      traceMsgM VMid TEval $ text "Evaluating App function"
+      fnVal <- evalM env fn
+      traceMsgM VMid TEval $ text "Evaluating App argument"
+      argVal <- evalM env arg
+      traceMsgM VMid TEval $ text "Applying argument to function"
+      applyElimM (length env) fnVal (EApp argVal)
+    Proj name idx struct -> do
+      traceMsgM VMid TEval $ text "Evaluating Proj structure:" <+> (ppr name <> "." <> (int idx))
+      structVal <- evalM env struct
+      applyElimM (length env) structVal (EProj name idx)
+    Const name levels -> do
+      traceMsgM VMid TEval $ text "Looking up Const:" <+> ppr name
+      mInfo <- lookupConstInfo name
+      case mInfo of
+        Just (DefnInfo def) -> do
+          traceMsgM VMid TEval $ text "Const is Defn. Instantiating levels and creating lazy thunk"
+          let subst = zip (constLevelParameters (defConst def)) levels
+          -- Eagerly substitute universes
+          instantiatedBody <- instantiateLevelParamsExpr subst (defValue def)
+          -- Suspend the evaluation of the body
+          let lazyThunk = evalM [] instantiatedBody
+          pure $ VDef name levels [] lazyThunk
+        _ -> do
+          traceMsgM VLow TEval $ text "Const is not a Defn, returning stuck Neutral."
+          pure $ VNeutral (HConst name levels) []
 
 -- | Push an elimination onto a WHNF Value
 applyElimM :: Int -> Value -> Elim -> KernelM Value
@@ -75,8 +81,8 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
     ((VNeutral (HConst recName recLvls) spine), elim) -> do
       -- Iota
       let newSpine = elim : spine
-          fallback :: KernelM Value = do
-            traceMsgM VMid TEval $ text "Keeping stuck neutral"
+          fallback reason = do
+            traceMsgM VLow TEval $ text "Returning stuck Neutral:" <+> text reason
             pure $ VNeutral (HConst recName recLvls) newSpine
       mInfo <- lookupConstInfo recName
       case mInfo of
@@ -85,7 +91,7 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
           -- hardcode quotient lifting reduction: Quot.lift f h (Quot.mk a) = f a
           -- newSpine = reverse [alpha, r, beta, f, h, major]
           if length newSpine < 6
-            then fallback
+            then fallback "not enough arguments for Quot.lift"
             else do
               let numExtra = length newSpine - 6
                   extraArgs = take numExtra newSpine
@@ -104,13 +110,13 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
                       fVal <- extractAppArgM 2 exactArgs
                       reduced <- applyElimM depth fVal (EApp aVal)
                       applyElimsM depth reduced extraArgs
-                    _ -> fallback
-                _ -> fallback
+                    _ -> fallback "major premise is not Quot.mk"
+                _ -> fallback "major premise is not a stuck application"
         Just (RecInfo recVal) -> do
           let expectedArgs = recParamsN recVal + recMotivesN recVal + recMinorsN recVal + recIndicesN recVal + 1
           traceMsgM VMid TEval $ text "Checking Recursor application. Expected args:" <+> int expectedArgs <+> text "Got:" <+> int (length newSpine)
           if length newSpine < expectedArgs
-            then fallback
+            then fallback "not enough arguments for recursor"
             else do
               let numExtra = length newSpine - expectedArgs
               let extraArgs = take numExtra newSpine
@@ -156,10 +162,10 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
                       val1 <- applyElimsM depth rhsVal paramsMotivesMinors
                       val2 <- applyElimsM depth val1 fields
                       applyElimsM depth val2 extraArgs
-                    _ -> fallback
+                    _ -> fallback "no matching constructor rule for recursor"
                 _ ->
                   if recKRule recVal
-                    then do
+                    then withTraceNode VLow TDefEq (text "K-rule recursor") $ do
                       traceMsgM VMid TEval $ text "Attempting K-rule reduction"
                       majorType <- inferValue depth normalizedMajor
                       forcedMajorType <- force majorType
@@ -201,22 +207,14 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
                                               let minorPremise = exactArgs !! (1 + recIndicesN recVal)
                                               case minorPremise of
                                                 EApp v -> applyElimsM depth v extraArgs
-                                                _ -> fallback
-                                            else do
-                                              traceMsgM VMid TEval $ text "Indices did not match. K-rule aborted."
-                                              fallback
-                                        _ -> do
-                                          traceMsgM VMid TEval $ text "Constructor type did not reduce to expected form. K-rule aborted."
-                                          fallback
-                                    _ -> do
-                                      traceMsgM VMid TEval $ text "Failed to lookup constructor. K-rule aborted."
-                                      fallback
-                                _ -> do
-                                  traceMsgM VMid TEval $ text "Failed to lookup inductive. K-rule aborted."
-                                  fallback
-                        _ -> fallback
-                    else fallback
-        _ -> fallback
+                                                _ -> fallback "minor premise is not an application"
+                                            else fallback "constructor indices did not match major premise indices"
+                                        _ -> fallback "constructor type did not reduce to expected form"
+                                    _ -> fallback "failed to lookup constructor"
+                                _ -> fallback "failed to lookup inductive"
+                        _ -> fallback "K-rule reduction not applicable: major premise type is not a neutral with the target inductive as head"
+                    else fallback "K-rule not enabled for this recursor"
+        _ -> fallback "head is not a recursor or quotient lifting constant"
     ((VNeutral head spine), elim) -> do
       traceMsgM VMid TEval $ text "Appending elim to neutral spine"
       pure $ VNeutral head (elim : spine)
@@ -248,11 +246,15 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
   case (val1, val2) of
     (VSort l1, VSort l2) -> do
       let eq = l1 == l2 || levelEquiv l1 l2
-      traceMsgM VMid TDefEq $ "Sort equality:" <+> text (show eq)
+      if eq
+        then traceMsgM VLow TDefEq $ green (text "Matched via level equivalence")
+        else traceMsgM VLow TDefEq $ text "Level mismatch:" <+> ppr l1 <+> text "vs" <+> ppr l2
       pure eq
     (VLit lit1, VLit lit2) -> do
       let eq = lit1 == lit2
-      traceMsgM VMid TDefEq $ "Lit equality:" <+> text (show eq)
+      if eq
+        then traceMsgM VLow TDefEq $ green (text "Matched via literal equality")
+        else traceMsgM VLow TDefEq $ text "Literal mismatch:" <+> ppr lit1 <+> text "vs" <+> ppr lit2
       pure eq
     _ -> do
       valType <- inferValue depth val1
@@ -289,9 +291,12 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
     matchCore :: Value -> Value -> KernelM Bool
     matchCore v1 v2 = case (v1, v2) of
       (VLam n1 _ ty1 clo1, VLam _ _ ty2 clo2) -> do
+        traceMsgM VMid TDefEq $ text "Comparing two lambdas. Checking domain types for:" <+> ppr n1
         typesEq <- isDefEqValue depth ty1 ty2
         if not typesEq
-          then pure False
+          then do
+            traceMsgM VLow TDefEq $ text "Lambda domain types do not match."
+            pure False
           else do
             let levelVal = VNeutral (HLvl n1 depth) []
             let decl = LocalDecl n1 ty1 Nothing
@@ -300,9 +305,12 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
               body2 <- evalM (levelVal : closureEnv clo2) (closureBody clo2)
               isDefEqValue (depth + 1) body1 body2
       (VPi n1 _ ty1 clo1, VPi _ _ ty2 clo2) -> do
+        traceMsgM VMid TDefEq $ text "Comparing two Pis. Checking domain types for:" <+> ppr n1
         typesEq <- isDefEqValue depth ty1 ty2
         if not typesEq
-          then pure False
+          then do
+            traceMsgM VLow TDefEq $ text "Pi domain types do not match."
+            pure False
           else do
             let levelVal = VNeutral (HLvl n1 depth) []
             let decl = LocalDecl n1 ty1 Nothing
@@ -311,12 +319,17 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
               body2 <- evalM (levelVal : closureEnv clo2) (closureBody clo2)
               isDefEqValue (depth + 1) body1 body2
       (VNeutral h1 s1, VNeutral h2 s2)
-        | h1 == h2 -> isDefEqSpine depth s1 s2
+        | h1 == h2 -> do
+            traceMsgM VMid TDefEq $ text "Comparing spines with because heads match."
+            isDefEqSpine depth s1 s2
       (VDef n1 _ s1 _, VDef n2 _ s2 _) | n1 == n2 -> do
         match <- isDefEqSpine depth s1 s2 `catchError` \_ -> pure False
         if match
-          then pure True
+          then do
+            traceMsgM VLow TDefEq $ green (text "Matched VDefs by head and spine")
+            pure True
           else do
+            traceMsgM VMid TDefEq $ text "VDefs have same head but different spines. Forcing bodies to compare."
             v1' <- force v1
             v2' <- force v2
             isDefEqValue depth v1' v2'
@@ -325,15 +338,20 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
         hint2 <- getDefHints n2
         case compare hint1 hint2 of
           LT -> do
+            traceMsgM VMid TDefEq $ text "Forcing LHS VDef first based on hints."
             v1' <- thunk1
             isDefEqValue depth v1' v2
           GT -> do
+            traceMsgM VMid TDefEq $ text "Forcing RHS VDef first based on hints."
             v2' <- thunk2
             isDefEqValue depth v1 v2'
           EQ -> do
             if hint1 == Opaque
-              then pure False
+              then do
+                traceMsgM VLow TDefEq $ red $ text "Both VDefs are opaque. Not unfolding and returning False."
+                pure False
               else do
+                traceMsgM VMid TDefEq $ text "Forcing both VDefs simultaneously based on equal hints."
                 withUnfoldingConst n1 $ do
                   v1' <- thunk1
                   withUnfoldingConst n2 $ do
@@ -342,7 +360,9 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
       (VDef n1 _ _ thunk1, _) -> do
         hint1 <- getDefHints n1
         if hint1 == Opaque
-          then pure False
+          then do
+            traceMsgM VLow TDefEq $ red $ text "LHS VDef is opaque. Not unfolding and returning False."
+            pure False
           else do
             withUnfoldingConst n1 $ do
               v1' <- thunk1
@@ -350,7 +370,9 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
       (_, VDef n2 _ _ thunk2) -> do
         hint2 <- getDefHints n2
         if hint2 == Opaque
-          then pure False
+          then do
+            traceMsgM VLow TDefEq $ red $ text "RHS VDef is opaque. Not unfolding and returning False."
+            pure False
           else do
             withUnfoldingConst n2 $ do
               v2' <- thunk2
@@ -358,17 +380,17 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
       (VLam n _ ty clo, other) -> checkEta depth n ty clo other
       (other, VLam n _ ty clo) -> checkEta depth n ty clo other
       (VNeutral (HConst c1 _) s1, other) -> do
-        traceMsgM VMid TDefEq $ "StructEta: Checking LHS const:" <+> ppr c1
+        traceMsgM VMid TDefEq $ "Checking structural eta on LHS const:" <+> ppr c1
         checkStructEta depth c1 s1 other `catchError` \e -> do
-          traceMsgM VMid TDefEq $ text "LHS checkStructEta threw:" <+> text e
+          traceMsgM VLow TDefEq $ red $ text "LHS checkStructEta threw:" <+> text e
           pure False
       (other, VNeutral (HConst c2 _) s2) -> do
-        traceMsgM VMid TDefEq $ "StructEta: Checking RHS const:" <+> ppr c2
+        traceMsgM VMid TDefEq $ "Checking structural eta on RHS const:" <+> ppr c2
         checkStructEta depth c2 s2 other `catchError` \e -> do
-          traceMsgM VMid TDefEq $ text "RHS checkStructEta threw:" <+> text e
+          traceMsgM VLow TDefEq $ red $ text "RHS checkStructEta threw:" <+> text e
           pure False
       _ -> do
-        traceMsgM VMid TDefEq $ text "matchCore fallback reached False."
+        traceMsgM VLow TDefEq $ red $ text "matchCore fallback reached False."
         pure False
 
 inferValue :: Int -> Value -> KernelM Value
@@ -679,7 +701,7 @@ isDefEqExprCore depth env expr1 expr2 = withTraceNode VLow TDefEq (text "isDefEq
             then do
               traceMsgM VLow TDefEq $ green $ text "Constants match exactly."
               pure True
-            else fallbackToWHNF "Constant levels do not match."
+            else fallbackToWHNF "constant levels do not match."
     ()
       | Just (LetView n1 ty1 v1 b1 nd1) <- viewLet expr1,
         Just (LetView _n2 ty2 v2 b2 nd2) <- viewLet expr2 ->
@@ -757,13 +779,13 @@ isDefEqExprCore depth env expr1 expr2 = withTraceNode VLow TDefEq (text "isDefEq
             )
               `catchError` \_ -> pure False
           if fastSuccess then pure True else fallbackToWHNF "Forall bodies differ."
-    () | otherwise -> fallbackToWHNF "All structural checks failed."
-    where
-      fallbackToWHNF reason = do
-        traceMsgM VMid TDefEq $ text "Falling back to WHNF comparison:" <+> text reason
-        val1 <- evalM env expr1
-        val2 <- evalM env expr2
-        isDefEqValue depth val1 val2
+    () | otherwise -> fallbackToWHNF "all structural checks failed."
+  where
+    fallbackToWHNF reason = do
+      traceMsgM VMid TDefEq $ text "Falling back to WHNF comparison:" <+> text reason
+      val1 <- evalM env expr1
+      val2 <- evalM env expr2
+      isDefEqValue depth val1 val2
 
 isDefEqSpine :: Int -> Spine -> Spine -> KernelM Bool
 isDefEqSpine depth s1 s2 = withTraceNode VLow TDefEq (text "isDefEqSpine" <+> "@" <+> ppr depth <+> ":" <+> ppr s1 <+> "=?=" <+> ppr s2) $ do

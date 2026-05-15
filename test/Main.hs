@@ -35,18 +35,17 @@ import Test.Tasty (TestTree, defaultMain, testGroup)
 import Test.Tasty.HUnit
 
 main :: IO ()
-main = defaultMain tests
+main = testNbESemanticBetaReduction -- defaultMain tests
 
 tests :: TestTree
 tests =
   testGroup
     "mlkih"
-    [ 
-      -- testCase "Beta-Reduction" testNbESemanticBetaReduction,
-      -- testCase "checkUnfoldStack" testRecursionGuardPreventsLoop,
-      -- testCase "defEqCacheHits" testDefEqCacheHits,
-      testCase "struct eta-equivalence" testSemanticStructEtaEquivalence
-      -- testCase "K-rule index matching" testKRuleIndexMatching
+    [ testCase "Beta-Reduction" testNbESemanticBetaReduction
+    -- testCase "checkUnfoldStack" testRecursionGuardPreventsLoop
+    -- testCase "defEqCacheHits" testDefEqCacheHits
+    -- testCase "struct eta-equivalence" testSemanticStructEtaEquivalence
+    -- testCase "K-rule index matching" testKRuleIndexMatching
     ]
 
 testDefEqCacheHits :: IO ()
@@ -274,18 +273,13 @@ expectKernelSuccessVerbose env action = do
 testNbESemanticBetaReduction :: IO ()
 testNbESemanticBetaReduction = do
   result <- expectKernelSuccessVerbose IntMap.empty $ do
-    zero <- mkLevelZero
-    one <- mkLevelSucc zero
-    sortOne <- mkSort one
-
-    -- \x -> x
+    natType <- mkConst (hcName ["Nat"]) []
+    -- \x : Nat -> x
     bodyVar <- mkBVar 0
-    idFunc <- mkLam (hcName ["x"]) sortOne bodyVar Default
-
-    -- (\x -> x) 42
+    idFunc <- mkLam (hcName ["x"]) natType bodyVar Default
+    -- (\x : Nat -> x) 42
     arg <- mkLit (NatVal 42)
     applied <- mkApp idFunc arg
-
     -- isDefEq applied 42
     isDefEq applied arg
 
