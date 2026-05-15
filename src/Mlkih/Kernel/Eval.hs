@@ -4,7 +4,7 @@
 
 module Mlkih.Kernel.Eval where
 
-import Control.Monad (foldM, forM, unless, zipWithM)
+import Control.Monad (foldM, unless, zipWithM)
 import Control.Monad.Except
 import Control.Monad.Reader (asks)
 import qualified Data.IntMap.Strict as IntMap
@@ -20,50 +20,50 @@ import Mlkih.Pretty
 --------------------------------------------------------------------------------
 
 evalM :: LocalEnv -> HCExpr -> KernelM Value
-evalM env expr = withTraceNode VLow TEval (text "evalM:" <+> ppr expr) $ do
-  traceMsgM VHigh TEval $ text "LocalEnv is" <+> ppr env
+evalM env expr = traceBlock PhEval TkEnter TraceDetail "eval.expr" [("expr", TrExpr expr), ("envLen", TrInt (length env))]  $ do
+  traceEvent PhEval TkEvent TraceDump "local.env" [("env", TrDoc (ppr env))]
   case hceVal expr of
     BVar idx -> do
-      traceMsgM VMid TEval $ text "Looking up bound variable"
+      traceEvent PhEval TkLookup TraceDetail "eval.bvar" [("index", TrInt idx)]
       pure $ env !! idx
     Sort lvl -> do
-      traceMsgM VMid TEval $ text "Returning Sort:" <+> ppr lvl
+      traceOk PhEval TkEvent TraceDetail "eval.sort" [("level", TrLevel lvl)]
       pure $ VSort lvl
     Lit lit -> do
-      traceMsgM VMid TEval $ text "Returning literal:" <+> ppr lit
+      traceOk PhEval TkEvent TraceDetail "eval.literal" [("literal", TrDoc (ppr lit))]
       pure $ VLit lit
     Lam name ty body bi -> do
-      traceMsgM VMid TEval $ text "Evaluating Lam domain type" <+> ppr name
+      traceEvent PhEval TkEvent TraceDetail "eval.lam.domain" [("binder", TrName name)]
       tyVal <- evalM env ty
-      traceMsgM VMid TEval $ text "Building closure for Lam body with environment"
+      traceEvent PhEval TkEvent TraceDump "eval.lam.closure" [("envLen", TrInt (length env))]
       pure $ VLam name bi tyVal (Closure env body)
     ForallE name ty body bi -> do
-      traceMsgM VMid TEval $ text "Evaluating Pi domain type:" <+> ppr name
+      traceEvent PhEval TkEvent TraceDetail "eval.pi.domain" [("binder", TrName name)]
       tyVal <- evalM env ty
-      traceMsgM VMid TEval $ text "Building closure for Pi body with environment"
+      traceEvent PhEval TkEvent TraceDump "eval.pi.closure" [("envLen", TrInt (length env))]
       pure $ VPi name bi tyVal (Closure env body)
     Let name _ val body _nondep -> do
-      traceMsgM VMid TEval $ text "Evaluating Let value:" <+> ppr name
+      traceEvent PhEval TkEvent TraceDetail "eval.let.value" [("name", TrName name)]
       valVal <- evalM env val
-      traceMsgM VMid TEval $ text "Evaluating Let body with value in environment"
+      traceEvent PhEval TkEvent TraceDetail "eval.let.body" [("newEnvLen", TrInt (length env + 1))]
       evalM (valVal : env) body
     App fn arg -> do
-      traceMsgM VMid TEval $ text "Evaluating App function"
+      traceEvent PhEval TkEvent TraceDetail "eval.app.fn" []
       fnVal <- evalM env fn
-      traceMsgM VMid TEval $ text "Evaluating App argument"
+      traceEvent PhEval TkEvent TraceDetail "eval.app.arg" []
       argVal <- evalM env arg
-      traceMsgM VMid TEval $ text "Applying argument to function"
+      traceEvent PhEval TkReduction TraceDetail "eval.app.apply" []
       applyElimM (length env) fnVal (EApp argVal)
     Proj name idx struct -> do
-      traceMsgM VMid TEval $ text "Evaluating Proj structure:" <+> (ppr name <> "." <> (int idx))
+      traceEvent PhEval TkEvent TraceDetail "eval.proj.struct" [("proj", TrName name), ("field", TrInt idx)]
       structVal <- evalM env struct
       applyElimM (length env) structVal (EProj name idx)
     Const name levels -> do
-      traceMsgM VMid TEval $ text "Looking up Const:" <+> ppr name
+      traceEvent PhLookup TkLookup TraceDetail "const.lookup" [("const", TrName name)]
       mInfo <- lookupConstInfo name
       case mInfo of
         Just (DefnInfo def) -> do
-          traceMsgM VMid TEval $ text "Const is Defn. Instantiating levels and creating lazy thunk"
+          traceEvent PhEval TkUnfold TraceDetail "const.def.lazy" [("const", TrName name), ("levels", TrDoc (ppr levels))]
           let subst = zip (constLevelParameters (defConst def)) levels
           -- Eagerly substitute universes
           instantiatedBody <- instantiateLevelParamsExpr subst (defValue def)
@@ -71,20 +71,20 @@ evalM env expr = withTraceNode VLow TEval (text "evalM:" <+> ppr expr) $ do
           let lazyThunk = evalM [] instantiatedBody
           pure $ VDef name levels [] lazyThunk
         _ -> do
-          traceMsgM VLow TEval $ text "Const is not a Defn, returning stuck Neutral."
+          traceStuck PhEval TkStuck TraceSummary "const.neutral" [("const", TrName name), ("levels", TrDoc (ppr levels))]
           pure $ VNeutral (HConst name levels) []
 
 -- | Push an elimination onto a WHNF Value
 applyElimM :: Int -> Value -> Elim -> KernelM Value
-applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" <+> int depth <+> ":" <+> ppr val <+> text "∘" <+> ppr elim) $
+applyElimM depth val elim = traceBlock PhReduce TkReduction TraceSummary "apply.elim" [("depth", TrInt depth), ("value", TrValueHead val), ("elim", TrElim elim)] $
   case (val, elim) of
     (VLam _ _ _ (Closure env body), EApp argVal) -> do
-      traceMsgM VMid TEval $ text "Beta Reduction: evaluating body with new environment"
+      traceProgress PhReduce TkReduction TraceDetail "beta.reduce" [("arg", TrValueHead argVal)]
       evalM (argVal : env) body
     (VNeutral (HConst ctorName ctorLvls) spine, EProj structName projIdx) -> do
       let newSpine = EProj structName projIdx : spine
           fallback reason = do
-            traceMsgM VLow TEval $ text "Returning stuck Neutral for Proj:" <+> text reason
+            traceStuck PhReduce TkStuck TraceSummary "proj.stuck" [("ctor", TrName ctorName), ("proj", TrName structName), ("field", TrInt projIdx), ("reason", TrString reason)]
             pure $ VNeutral (HConst ctorName ctorLvls) newSpine
       mIndInfo <- lookupConstInfo structName
       case mIndInfo of
@@ -98,7 +98,7 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
               if targetIdx >= 0 && targetIdx < numFields
                 then case spine !! targetIdx of
                   EApp fieldVal -> do
-                    traceMsgM VMid TEval $ text "Successfully reduced projection!"
+                    traceProgress PhReduce TkReduction TraceDetail "proj.reduce" [("ctor", TrName ctorName), ("proj", TrName structName), ("field", TrInt projIdx)]
                     pure fieldVal
                   _ -> fallback "constructor argument is not an EApp"
                 else
@@ -110,12 +110,12 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
       -- Iota
       let newSpine = elim : spine
           fallback reason = do
-            traceMsgM VLow TEval $ text "Returning stuck Neutral:" <+> text reason
+            traceStuck PhReduce TkStuck TraceSummary "neutral.stuck" [("head", TrName recName), ("reason", TrString reason), ("spineLen", TrInt (length newSpine))]
             pure $ VNeutral (HConst recName recLvls) newSpine
       mInfo <- lookupConstInfo recName
       case mInfo of
         Just (QuotInfo quotVal) | quotKind quotVal == QuotLift -> do
-          traceMsgM VMid TEval $ text "Checking QuotLift reduction. Args:" <+> int (length newSpine)
+          traceEvent PhReduce TkDecision TraceDetail "quot.lift.try" [("const", TrName recName), ("args", TrInt (length newSpine))]
           -- hardcode quotient lifting reduction: Quot.lift f h (Quot.mk a) = f a
           -- newSpine = reverse [alpha, r, beta, f, h, major]
           if length newSpine < 6
@@ -124,7 +124,7 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
               let numExtra = length newSpine - 6
                   extraArgs = take numExtra newSpine
                   exactArgs = drop numExtra newSpine
-              traceMsgM VMid TEval $ text "Extracting major premise"
+              traceEvent PhReduce TkSpine TraceDetail "quot.lift.major" [("exactArgs", TrInt (length exactArgs)), ("extraArgs", TrInt (length extraArgs))]
               majorVal <- extractAppArgM 0 exactArgs
               forcedMajor <- force majorVal
               case forcedMajor of
@@ -132,7 +132,7 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
                   mMkInfo <- lookupConstInfo mkName
                   case mMkInfo of
                     Just (QuotInfo mkVal) | quotKind mkVal == QuotMk -> do
-                      traceMsgM VMid TEval $ text "Applying Quot.lift to Quot.mk"
+                      traceProgress PhReduce TkReduction TraceDetail "quot.lift.reduce" [("lift", TrName recName), ("mk", TrName mkName)]
                       -- Quot.mk takes [alpha, r, a]
                       aVal <- extractAppArgM 0 mkSpine
                       fVal <- extractAppArgM 2 exactArgs
@@ -142,14 +142,14 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
                 _ -> fallback "major premise is not a stuck application"
         Just (RecInfo recVal) -> do
           let expectedArgs = recParamsN recVal + recMotivesN recVal + recMinorsN recVal + recIndicesN recVal + 1
-          traceMsgM VMid TEval $ text "Checking Recursor application. Expected args:" <+> int expectedArgs <+> text "Got:" <+> int (length newSpine)
+          traceEvent PhReduce TkSpine TraceDetail "recursor.args" [("recursor", TrName recName), ("expected", TrInt expectedArgs), ("actual", TrInt (length newSpine)), ("params", TrInt (recParamsN recVal)), ("motives", TrInt (recMotivesN recVal)), ("minors", TrInt (recMinorsN recVal)), ("indices", TrInt (recIndicesN recVal))]
           if length newSpine < expectedArgs
             then fallback "not enough arguments for recursor"
             else do
               let numExtra = length newSpine - expectedArgs
               let extraArgs = take numExtra newSpine
               let exactArgs = drop numExtra newSpine
-              traceMsgM VMid TEval $ text "Extracting and forcing major premise"
+              traceEvent PhReduce TkForce TraceDetail "recursor.major.force" [("recursor", TrName recName)]
               -- Extract the major premise
               majorVal <- extractAppArgM 0 exactArgs
               forcedMajor <- force majorVal
@@ -157,14 +157,14 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
               case normalizedMajor of
                 VNeutral (HConst ctorName _) ctorSpine -> do
                   -- major premise is ctor
-                  traceMsgM VMid TEval $ text "Recursor major premise is constructor:" <+> ppr ctorName
+                  traceEvent PhReduce TkDecision TraceDetail "recursor.major.constructor" [("recursor", TrName recName), ("ctor", TrName ctorName), ("ctorSpineLen", TrInt (length ctorSpine))]
                   mRule <-
                     (Just <$> lookupValidatedRecursorRule recName ctorName) `catchError` \err -> do
-                      traceMsgM VMid TEval $ text "Failed to find validated recursor rule:" <+> text err
+                      traceFail PhReduce TkLookup TraceDetail "recursor.rule.missing" [("recursor", TrName recName), ("ctor", TrName ctorName), ("error", TrString err)]
                       pure Nothing
                   case mRule of
                     Just rule -> do
-                      traceMsgM VMid TEval $ text "Found rule. Applying iota reduction."
+                      traceProgress PhReduce TkReduction TraceDetail "recursor.iota" [("recursor", TrName recName), ("ctor", TrName ctorName)]
                       -- Extract the params, motives, and minors
                       -- exactArgs (reversed AST order): [major, indices..., minors..., motives..., params...]
                       let paramsMotivesMinors = drop (1 + recIndicesN recVal) exactArgs
@@ -173,25 +173,25 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
                       let fields = take (recFieldsN rule) ctorSpine
                       -- Evaluate RHS
                       let subst = zip (constLevelParameters (recConst recVal)) recLvls
-                      traceMsgM VMid TEval $ text "Evaluating rule RHS"
+                      traceEvent PhReduce TkEvent TraceDetail "recursor.rhs.eval" [("recursor", TrName recName), ("ctor", TrName ctorName)]
                       rhsExpr <- instantiateLevelParamsExpr subst (recRhs rule)
                       rhsVal <- evalM [] rhsExpr
-                      traceMsgM VMid TEval $ text "Applying params, motives, minors, and fields to RHS"
+                      traceEvent PhReduce TkSpine TraceDetail "recursor.rhs.apply" [("paramsMotivesMinors", TrInt (length paramsMotivesMinors)), ("fields", TrInt (length fields)), ("extra", TrInt (length extraArgs))]
                       val1 <- applyElimsM depth rhsVal paramsMotivesMinors
                       val2 <- applyElimsM depth val1 fields
                       applyElimsM depth val2 extraArgs
                     _ -> fallback "no matching constructor rule for recursor"
                 _ ->
                   if recKRule recVal
-                    then withTraceNode VLow TDefEq (text "K-rule recursor") $ do
-                      traceMsgM VMid TEval $ text "Attempting K-rule reduction"
+                    then traceBlock PhReduce TkReduction TraceDetail "recursor.k" [("recursor", TrName recName)] $ do
+                      traceEvent PhReduce TkDecision TraceDetail "k.try" [("recursor", TrName recName)]
                       majorType <- inferValue depth normalizedMajor
                       forcedMajorType <- force majorType
                       targetInductive <- lookupValidatedRecursorTargetInductive recName
                       case forcedMajorType of
                         VNeutral (HConst indName indLvls) indSpine
                           | indName == targetInductive -> do
-                              traceMsgM VMid TEval $ text "Major premise type matches target inductive. Checking indices."
+                              traceEvent PhReduce TkDecision TraceDetail "k.major.type.match" [("target", TrName targetInductive), ("indices", TrInt (recIndicesN recVal))]
                               -- indSpine (reversed): [indices..., params...]
                               let numIndices = recIndicesN recVal
                                   actualIndices = take numIndices indSpine
@@ -203,25 +203,25 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
                                   mCtorInfo <- lookupConstInfo ctorName
                                   case mCtorInfo of
                                     Just (CtorInfo ctorVal) -> do
-                                      traceMsgM VMid TEval $ text "Instantiating constructor using major premise's levels"
+                                      traceEvent PhReduce TkEvent TraceDetail "k.ctor.instantiate" [("ctor", TrName ctorName), ("levels", TrDoc (ppr indLvls))]
                                       let subst = zip (constLevelParameters (ctorConst ctorVal)) indLvls
                                       ctorTypeExpr <- instantiateLevelParamsExpr subst (constType (ctorConst ctorVal))
                                       ctorTypeVal <- evalM [] ctorTypeExpr
-                                      traceMsgM VMid TEval $ text "Applying parameters to the constructor's type"
+                                      traceEvent PhReduce TkSpine TraceDetail "k.ctor.params" [("params", TrInt (length params))]
                                       paramVals <- mapM extractArgM (reverse params)
                                       ctorTyAfterParams <- foldM instantiatePi ctorTypeVal paramVals
                                       forcedCtorTy <- force ctorTyAfterParams
                                       case forcedCtorTy of
                                         VNeutral (HConst indName2 _) cSpine | indName2 == targetInductive -> do
-                                          traceMsgM VMid TEval $ text "Extracting constructor's generated indices"
+                                          traceEvent PhReduce TkSpine TraceDetail "k.ctor.indices" [("indices", TrInt numIndices)]
                                           let cIndices = take numIndices cSpine
                                           cIndexVals <- mapM extractArgM cIndices
                                           actualIndexVals <- mapM extractArgM actualIndices
-                                          traceMsgM VMid TEval $ text "Checking if constructor's generated indices match major premise indices"
+                                          traceEvent PhDefEq TkCompare TraceDetail "k.indices.compare" [("indices", TrInt numIndices)]
                                           indicesMatch <- and <$> zipWithM (isDefEqValue depth) actualIndexVals cIndexVals
                                           if indicesMatch
                                             then do
-                                              traceMsgM VMid TEval $ text "Indices match. K-rule applies, returning minor premise"
+                                              traceProgress PhReduce TkReduction TraceDetail "k.reduce" [("recursor", TrName recName)]
                                               let minorPremise = exactArgs !! (1 + recIndicesN recVal)
                                               case minorPremise of
                                                 EApp v -> applyElimsM depth v extraArgs
@@ -234,10 +234,10 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
                     else fallback "K-rule not enabled for this recursor"
         _ -> fallback "head is not a recursor or quotient lifting constant"
     ((VNeutral head spine), elim) -> do
-      traceMsgM VMid TEval $ text "Appending elim to neutral spine"
+      traceEvent PhReduce TkSpine TraceDetail "neutral.spine.push" [("head", TrHead head), ("oldLen", TrInt (length spine)), ("newLen", TrInt (length spine + 1))]
       pure $ VNeutral head (elim : spine)
     ((VDef name levels spine thunk), elim) -> do
-      traceMsgM VMid TEval $ text "Pushing elim to lazy VDef thunk:" <+> ppr name
+      traceEvent PhReduce TkSpine TraceDetail "vdef.spine.push" [("const", TrName name), ("oldLen", TrInt (length spine)), ("newLen", TrInt (length spine + 1))]
       let newSpine = elim : spine
       -- To prevent forcing the thunk immediately, we wrap the application in a new thunk
       let newThunk = do
@@ -245,34 +245,35 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
             applyElimM depth forcedBody elim
       pure $ VDef name levels newSpine newThunk
     _ -> do
-      traceMsgM VMid TEval $ text "Ill-typed application detected."
+      traceFail PhReduce TkFailure TraceSummary "apply.illtyped" [("value", TrValueHead val), ("elim", TrElim elim)]
       throwError "Ill-typed application"
 
 applyElimsM :: Int -> Value -> Spine -> KernelM Value
 applyElimsM depth baseVal spine =
-  withTraceNode VLow TEval (text "applyElimsM:" <+> ppr baseVal <+> text "spine length:" <+> text (show $ length spine)) $
+  traceBlock PhReduce TkSpine TraceDetail "spine.apply.rev" [("depth", TrInt depth), ("base", TrValueHead baseVal), ("spineLen", TrInt (length spine)), ("orientation", TrString "reversed")] $
     foldM (applyElimM depth) baseVal (reverse spine)
 
 -- | Force a VDef thunk
 force :: Value -> KernelM Value
 force v = case v of
-  VDef n _ _ thunk -> withTraceNode VLow TEval (text "force VDef:" <+> ppr n) $ thunk >>= force
+  VDef n lvls spine thunk -> traceBlock PhReduce TkForce TraceSummary "force.vdef" [("const", TrName n), ("levels", TrDoc (ppr lvls)), ("spineLen", TrInt (length spine))] $ thunk >>= force
   _ -> pure v
 
 isDefEqValue :: Int -> Value -> Value -> KernelM Bool
-isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@" <+> ppr depth <+> ":" <+> ppr val1 <+> text "=?=" <+> ppr val2) $ do
+isDefEqValue depth val1 val2 = traceBlock PhDefEq TkCompare TraceSummary "defeq.value" [("depth", TrInt depth), ("lhs", TrValueHead val1), ("rhs", TrValueHead val2)] $ do
+  traceEvent PhDefEq TkCompare TraceDump "defeq.value.full" [("lhs", TrValue val1), ("rhs", TrValue val2)]
   case (val1, val2) of
     (VSort l1, VSort l2) -> do
       let eq = l1 == l2 || levelEquiv l1 l2
       if eq
-        then traceMsgM VLow TDefEq $ green (text "Matched via level equivalence")
-        else traceMsgM VLow TDefEq $ text "Level mismatch:" <+> ppr l1 <+> text "vs" <+> ppr l2
+        then traceOk PhDefEq TkCompare TraceSummary "defeq.levels" [("lhs", TrLevel l1), ("rhs", TrLevel l2)]
+        else traceFail PhDefEq TkCompare TraceSummary "defeq.levels" [("lhs", TrLevel l1), ("rhs", TrLevel l2)]
       pure eq
     (VLit lit1, VLit lit2) -> do
       let eq = lit1 == lit2
       if eq
-        then traceMsgM VLow TDefEq $ green (text "Matched via literal equality")
-        else traceMsgM VLow TDefEq $ text "Literal mismatch:" <+> ppr lit1 <+> text "vs" <+> ppr lit2
+        then traceOk PhDefEq TkCompare TraceSummary "defeq.literals" [("lhs", TrDoc (ppr lit1)), ("rhs", TrDoc (ppr lit2))]
+        else traceFail PhDefEq TkCompare TraceSummary "defeq.literals" [("lhs", TrDoc (ppr lit1)), ("rhs", TrDoc (ppr lit2))]
       pure eq
     _ -> do
       val1 <- expandLiteralCtor val1
@@ -284,19 +285,19 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
             _ -> False
       if isProp
         then do
-          traceMsgM VLow TDefEq $ green (text "Matched via Proof Irrelevance")
+          traceOk PhDefEq TkCompare TraceSummary "defeq.proofIrrelevance" [("type", TrValueHead valType)]
           pure True
         else do
           z1 <- tryZeta val1
           case z1 of
             Just u1 -> do
-              traceMsgM VMid TDefEq $ text "Zeta reduced LHS"
+              traceProgress PhDefEq TkReduction TraceDetail "zeta.lhs" [("level", TrValueHead val1)]
               isDefEqValue depth u1 val2
             Nothing -> do
               z2 <- tryZeta val2
               case z2 of
                 Just u2 -> do
-                  traceMsgM VMid TDefEq $ text "Zeta reduced RHS"
+                  traceProgress PhDefEq TkReduction TraceDetail "zeta.rhs" [("level", TrValueHead val2)]
                   isDefEqValue depth val1 u2
                 Nothing -> matchCore val1 val2
   where
@@ -311,11 +312,11 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
     matchCore :: Value -> Value -> KernelM Bool
     matchCore v1 v2 = case (v1, v2) of
       (VLam n1 _ ty1 clo1, VLam _ _ ty2 clo2) -> do
-        traceMsgM VMid TDefEq $ text "Comparing two lambdas. Checking domain types for:" <+> ppr n1
+        traceEvent PhDefEq TkCompare TraceDetail "defeq.lam.domains" [("binder", TrName n1)]
         typesEq <- isDefEqValue depth ty1 ty2
         if not typesEq
           then do
-            traceMsgM VLow TDefEq $ text "Lambda domain types do not match."
+            traceFail PhDefEq TkCompare TraceSummary "defeq.lam.domainMismatch" [("binder", TrName n1)]
             pure False
           else do
             let levelVal = VNeutral (HLvl n1 depth) []
@@ -325,11 +326,11 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
               body2 <- evalM (levelVal : closureEnv clo2) (closureBody clo2)
               isDefEqValue (depth + 1) body1 body2
       (VPi n1 _ ty1 clo1, VPi _ _ ty2 clo2) -> do
-        traceMsgM VMid TDefEq $ text "Comparing two Pis. Checking domain types for:" <+> ppr n1
+        traceEvent PhDefEq TkCompare TraceDetail "defeq.pi.domains" [("binder", TrName n1)]
         typesEq <- isDefEqValue depth ty1 ty2
         if not typesEq
           then do
-            traceMsgM VLow TDefEq $ text "Pi domain types do not match."
+            traceFail PhDefEq TkCompare TraceSummary "defeq.pi.domainMismatch" [("binder", TrName n1)]
             pure False
           else do
             let levelVal = VNeutral (HLvl n1 depth) []
@@ -340,16 +341,16 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
               isDefEqValue (depth + 1) body1 body2
       (VNeutral h1 s1, VNeutral h2 s2)
         | h1 == h2 -> do
-            traceMsgM VMid TDefEq $ text "Comparing spines with because heads match."
+            traceEvent PhDefEq TkSpine TraceDetail "defeq.neutral.sameHead" [("head", TrHead h1), ("lhsLen", TrInt (length s1)), ("rhsLen", TrInt (length s2))]
             isDefEqSpine depth s1 s2
       (VDef n1 _ s1 _, VDef n2 _ s2 _) | n1 == n2 -> do
         match <- isDefEqSpine depth s1 s2 `catchError` \_ -> pure False
         if match
           then do
-            traceMsgM VLow TDefEq $ green (text "Matched VDefs by head and spine")
+            traceOk PhDefEq TkCompare TraceSummary "defeq.vdef.sameHeadSpine" [("const", TrName n1), ("spineLen", TrInt (length s1))]
             pure True
           else do
-            traceMsgM VMid TDefEq $ text "VDefs have same head but different spines. Forcing bodies to compare."
+            traceEvent PhDefEq TkForce TraceDetail "defeq.vdef.sameHead.diffSpine" [("const", TrName n1)]
             v1' <- force v1
             v2' <- force v2
             isDefEqValue depth v1' v2'
@@ -358,20 +359,20 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
         hint2 <- getDefHints n2
         case compare hint1 hint2 of
           LT -> do
-            traceMsgM VMid TDefEq $ text "Forcing LHS VDef first based on hints."
+            traceEvent PhDefEq TkUnfold TraceDetail "defeq.vdef.unfold.lhs" [("const", TrName n1), ("hint", TrDoc (ppr hint1))]
             v1' <- thunk1
             isDefEqValue depth v1' v2
           GT -> do
-            traceMsgM VMid TDefEq $ text "Forcing RHS VDef first based on hints."
+            traceEvent PhDefEq TkUnfold TraceDetail "defeq.vdef.unfold.rhs" [("const", TrName n2), ("hint", TrDoc (ppr hint2))]
             v2' <- thunk2
             isDefEqValue depth v1 v2'
           EQ -> do
             if hint1 == Opaque
               then do
-                traceMsgM VLow TDefEq $ red $ text "Both VDefs are opaque. Not unfolding and returning False."
+                traceFail PhDefEq TkUnfold TraceSummary "defeq.vdef.opaque.both" [("lhs", TrName n1), ("rhs", TrName n2)]
                 pure False
               else do
-                traceMsgM VMid TDefEq $ text "Forcing both VDefs simultaneously based on equal hints."
+                traceEvent PhDefEq TkUnfold TraceDetail "defeq.vdef.unfold.both" [("lhs", TrName n1), ("rhs", TrName n2), ("hint", TrDoc (ppr hint1))]
                 v1' <- thunk1
                 v2' <- thunk2
                 isDefEqValue depth v1' v2'
@@ -379,7 +380,7 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
         hint1 <- getDefHints n1
         if hint1 == Opaque
           then do
-            traceMsgM VLow TDefEq $ red $ text "LHS VDef is opaque. Not unfolding and returning False."
+            traceFail PhDefEq TkUnfold TraceSummary "defeq.vdef.opaque.lhs" [("const", TrName n1)]
             pure False
           else do
             v1' <- thunk1
@@ -388,7 +389,7 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
         hint2 <- getDefHints n2
         if hint2 == Opaque
           then do
-            traceMsgM VLow TDefEq $ red $ text "RHS VDef is opaque. Not unfolding and returning False."
+            traceFail PhDefEq TkUnfold TraceSummary "defeq.vdef.opaque.rhs" [("const", TrName n2)]
             pure False
           else do
             v2' <- thunk2
@@ -396,17 +397,17 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
       (VLam n _ ty clo, other) -> checkEta depth n ty clo other
       (other, VLam n _ ty clo) -> checkEta depth n ty clo other
       (VNeutral (HConst c1 _) s1, other) -> do
-        traceMsgM VMid TDefEq $ "Checking structural eta on LHS const:" <+> ppr c1
+        traceEvent PhEta TkDecision TraceDetail "eta.struct.lhs" [("ctor", TrName c1), ("spineLen", TrInt (length s1))]
         checkStructEta depth c1 s1 other `catchError` \e -> do
-          traceMsgM VLow TDefEq $ red $ text "LHS checkStructEta threw:" <+> text e
+          traceFail PhEta TkError TraceSummary "eta.struct.lhs.error" [("ctor", TrName c1), ("error", TrString e)]
           pure False
       (other, VNeutral (HConst c2 _) s2) -> do
-        traceMsgM VMid TDefEq $ "Checking structural eta on RHS const:" <+> ppr c2
+        traceEvent PhEta TkDecision TraceDetail "eta.struct.rhs" [("ctor", TrName c2), ("spineLen", TrInt (length s2))]
         checkStructEta depth c2 s2 other `catchError` \e -> do
-          traceMsgM VLow TDefEq $ red $ text "RHS checkStructEta threw:" <+> text e
+          traceFail PhEta TkError TraceSummary "eta.struct.rhs.error" [("ctor", TrName c2), ("error", TrString e)]
           pure False
       _ -> do
-        traceMsgM VLow TDefEq $ red $ text "matchCore fallback reached False."
+        traceFail PhDefEq TkFallback TraceSummary "defeq.noRule" [("lhs", TrValueHead v1), ("rhs", TrValueHead v2)]
         pure False
 
 reconstructEnv :: Int -> KernelM LocalEnv
@@ -419,7 +420,7 @@ reconstructEnv d = do
   mapM mkVal $ reverse [0 .. d - 1]
 
 inferValue :: Int -> Value -> KernelM Value
-inferValue depth val = withTraceNode VLow TInfer (text "inferValue" <+> "@" <+> int depth <+> ":" <+> ppr val) $ case val of
+inferValue depth val = traceBlock PhInfer TkEnter TraceSummary "infer.value" [("depth", TrInt depth), ("value", TrValueHead val)] $ case val of
   VSort lvl -> VSort <$> mkLevelSucc lvl
   VLit (NatVal _) -> do
     name <- withIntern $ internName $ simpleName "Nat"
@@ -452,25 +453,25 @@ inferValue depth val = withTraceNode VLow TInfer (text "inferValue" <+> "@" <+> 
   VDef name lvls spine _ -> inferHeadApp depth (HConst name lvls) spine
 
 ensureSort :: Value -> KernelM HCLevel
-ensureSort val = withTraceNode VLow TInfer (text "ensureSort:" <+> ppr val) $ do
+ensureSort val = traceBlock PhInfer TkDecision TraceSummary "ensure.sort" [("value", TrValueHead val)] $ do
   forced <- force val
   case forced of
     VSort lvl -> do
-      traceMsgM VLow TInfer $ green $ text "Successfully extracted Sort:" <+> ppr lvl
+      traceOk PhInfer TkDecision TraceSummary "ensure.sort.ok" [("level", TrLevel lvl)]
       pure lvl
     _ -> do
-      traceMsgM VLow TInfer $ text "Failed: Value is not a Sort"
+      traceFail PhInfer TkDecision TraceSummary "ensure.sort.fail" [("value", TrValueHead forced)]
       throwError "Expected a Sort"
 
 ensurePi :: Value -> KernelM (HCName, BinderInfo, Value, Closure)
-ensurePi val = withTraceNode VLow TInfer (text "ensurePi:" <+> ppr val) $ do
+ensurePi val = traceBlock PhInfer TkDecision TraceSummary "ensure.pi" [("value", TrValueHead val)] $ do
   forced <- force val
   case forced of
     VPi n bi ty clo -> do
-      traceMsgM VLow TInfer $ green $ text "Successfully extracted Pi for:" <+> ppr n
+      traceOk PhInfer TkDecision TraceSummary "ensure.pi.ok" [("binder", TrName n)]
       pure (n, bi, ty, clo)
     _ -> do
-      traceMsgM VLow TInfer $ text "Failed: Value is not a Pi (Forall) type"
+      traceFail PhInfer TkDecision TraceSummary "ensure.pi.fail" [("value", TrValueHead forced)]
       throwError "Expected a Pi (Forall) type"
 
 expandLiteralCtor :: Value -> KernelM Value
@@ -489,7 +490,7 @@ expandNatLitCtor n
       pure $ VNeutral (HConst succ []) [EApp (VLit (NatVal (n - 1)))]
 
 inferExpr :: Int -> LocalEnv -> HCExpr -> KernelM Value
-inferExpr depth env expr = withTraceNode VLow TInfer (text "inferExpr" <+> "@" <+> int depth <+> ":" <+> ppr expr) $ case hceVal expr of
+inferExpr depth env expr =traceBlock PhInfer TkEnter TraceSummary "infer.expr" [("depth", TrInt depth), ("expr", TrExpr expr), ("envLen", TrInt (length env))] $ case hceVal expr of
   Sort lvl -> VSort <$> mkLevelSucc lvl
   Lit (NatVal _) -> do
     name <- withIntern $ internName $ simpleName "Nat"
@@ -504,10 +505,10 @@ inferExpr depth env expr = withTraceNode VLow TInfer (text "inferExpr" <+> "@" <
       then throwError $ "De Bruijn index out of bounds: " ++ show idx
       else do
         let lvl = depth - 1 - idx
-        traceMsgM VMid TInfer $ text "Looking up type in local context for BVar index:" <+> int idx <+> text "which corresponds to level:" <+> int lvl
+        traceEvent PhInfer TkLookup TraceDetail "infer.bvar" [("index", TrInt idx), ("level", TrInt lvl)]
         lookupLocalType lvl
   Const name levels -> do
-    traceMsgM VMid TInfer $ text "Looking up Const type:" <+> ppr name
+    traceEvent PhLookup TkLookup TraceDetail "infer.const.lookup" [("const", TrName name), ("levels", TrDoc (ppr levels))]
     mInfo <- lookupConstInfo name
     case mInfo of
       Just info -> do
@@ -516,71 +517,72 @@ inferExpr depth env expr = withTraceNode VLow TInfer (text "inferExpr" <+> "@" <
         evalM [] instTypeExpr
       Nothing -> throwError "Unknown constant"
   App fn arg -> do
-    traceMsgM VMid TInfer $ text "Inferring function type"
+    traceEvent PhInfer TkEvent TraceDetail "infer.app.fnType" []
     fnTypeVal <- inferExpr depth env fn
     (_, _, domTypeVal, clo) <- ensurePi fnTypeVal
-    traceMsgM VMid TInfer $ text "Evaluating argument and inferring its type"
+    traceEvent PhInfer TkEvent TraceDetail "infer.app.arg" []
     argVal <- evalM env arg
     argTypeVal <- inferValue depth argVal
-    traceMsgM VMid TInfer $ text "Checking argument type against domain type"
+    traceEvent PhDefEq TkCompare TraceDetail "infer.app.checkArg" [("argType", TrValueHead argTypeVal), ("domain", TrValueHead domTypeVal)]
     isArgTypeOk <- isDefEqValue depth argTypeVal domTypeVal
     if not isArgTypeOk
       then do
-        traceMsgM VLow TInfer $ text "Type mismatch: Arg type" <+> ppr argTypeVal <+> text "!= Domain type" <+> ppr domTypeVal
+        traceFail PhInfer TkFailure TraceSummary "infer.app.argMismatch" [("argType", TrValueHead argTypeVal), ("domain", TrValueHead domTypeVal)]
+        traceEvent PhInfer TkEvent TraceDump "infer.app.argMismatch.full" [("argType", TrValue argTypeVal), ("domain", TrValue domTypeVal)]
         throwError "Argument type mismatch"
       else do
-        traceMsgM VLow TInfer $ text "Type check passed. Instantiating codomain."
+        traceOk PhInfer TkDecision TraceSummary "infer.app.ok" [("domain", TrValueHead domTypeVal)]
         evalM (argVal : closureEnv clo) (closureBody clo)
   Lam name ty body bi -> do
-    traceMsgM VMid TInfer $ text "Inferring Lam domain type"
+    traceEvent PhInfer TkEvent TraceDetail "infer.lam.domain" [("binder", TrName name)]
     tySort <- inferExpr depth env ty
     _ <- ensureSort tySort
     domTypeVal <- evalM env ty
     let decl = LocalDecl name domTypeVal Nothing
     let levelVal = VNeutral (HLvl name depth) []
-    traceMsgM VMid TInfer $ text "Inferring Lam body type with HLvl pushed to context"
+    traceEvent PhLocalCtx TkEnter TraceDetail "infer.lam.body" [("binder", TrName name), ("level", TrInt depth)]
     bodyTypeVal <- withLocalDecl depth decl $ inferExpr (depth + 1) (levelVal : env) body
     bodyTypeExpr <- quote (depth + 1) bodyTypeVal
     pure $ VPi name bi domTypeVal (Closure env bodyTypeExpr)
   ForallE name ty body _ -> do
-    traceMsgM VMid TInfer $ text "Inferring Pi domain sort"
+    traceEvent PhInfer TkEvent TraceDetail "infer.pi.domain" [("binder", TrName name)]
     tySort <- inferExpr depth env ty
     forcedTySort <- force tySort
     lvl1 <- ensureSort forcedTySort
     domTypeVal <- evalM env ty
     let decl = LocalDecl name domTypeVal Nothing
     let levelVal = VNeutral (HLvl name depth) []
-    traceMsgM VMid TInfer $ text "Inferring Pi codomain sort with HLvl pushed to context"
+    traceEvent PhLocalCtx TkEnter TraceDetail "infer.pi.codomain" [("binder", TrName name), ("level", TrInt depth)]
     bodyTypeVal <- withLocalDecl depth decl $ inferExpr (depth + 1) (levelVal : env) body
     lvl2 <- ensureSort bodyTypeVal
-    traceMsgM VMid TInfer $ text "Calculating IMax for Pi universe level"
+    traceEvent PhInfer TkEvent TraceDetail "infer.pi.imax" [("domainLevel", TrLevel lvl1), ("codomainLevel", TrLevel lvl2)]
     imaxLvl <- mkLevelIMax lvl1 lvl2
     pure $ VSort imaxLvl
   Let name ty value body nondep -> do
-    traceMsgM VMid TInfer $ text "Inferring Let binding type"
+    traceEvent PhInfer TkEvent TraceDetail "infer.let.type" [("name", TrName name)]
     tySort <- inferExpr depth env ty
     _ <- ensureSort tySort
     tyVal <- evalM env ty
     valueVal <- evalM env value
     valueTypeVal <- inferValue depth valueVal
-    traceMsgM VMid TInfer $ text "Checking value type matches annotated type"
+    traceEvent PhDefEq TkCompare TraceDetail "infer.let.checkValue" [("valueType", TrValueHead valueTypeVal), ("annotated", TrValueHead tyVal)]
     isValueTypeOk <- isDefEqValue depth valueTypeVal tyVal
     if not isValueTypeOk
       then do
-        traceMsgM VLow TInfer $ text "Type mismatch in Let binding"
+        traceFail PhInfer TkFailure TraceSummary "infer.let.mismatch" [("name", TrName name), ("valueType", TrValueHead valueTypeVal), ("annotated", TrValueHead tyVal)]
         throwError "Let-binding type mismatch"
       else do
-        traceMsgM VLow TInfer $ text "Inferring Let body type"
+        traceEvent PhInfer TkEvent TraceDetail "infer.let.body" [("name", TrName name)]
         let decl = LocalDecl name tyVal (if nondep then Nothing else Just valueVal)
         let levelVal = VNeutral (HLvl name depth) []
         withLocalDecl depth decl $ inferExpr (depth + 1) (levelVal : env) body
   Proj projName fieldIdx structExpr -> do
-    traceMsgM VMid TInfer $ text "Inferring Proj structure type"
+    traceEvent PhInfer TkEvent TraceDetail "infer.proj.struct" [("proj", TrName projName), ("field", TrInt fieldIdx)]
     structTyVal <- inferExpr depth env structExpr
     forcedStructTy <- force structTyVal
     case forcedStructTy of
       VNeutral (HConst indName indLvls) indSpine -> do
-        traceMsgM VMid TInfer $ text "Structure is inductive:" <+> ppr indName
+        traceEvent PhInfer TkDecision TraceDetail "infer.proj.inductive" [("inductive", TrName indName), ("field", TrInt fieldIdx)]
         mInfo <- lookupConstInfo indName
         case mInfo of
           Just (InductInfo indVal) -> do
@@ -593,7 +595,7 @@ inferExpr depth env expr = withTraceNode VLow TInfer (text "inferExpr" <+> "@" <
             if (fieldIdx < 0 || fieldIdx >= ctorFieldsN ctor)
               then throwError "Field index out of bounds for constructor projection"
               else do
-                traceMsgM VMid TInfer $ text "Instantiating constructor parameters and previous fields"
+                traceEvent PhInfer TkSpine TraceDetail "infer.proj.fieldType" [("ctor", TrName (constName (ctorConst ctor))), ("field", TrInt fieldIdx), ("indSpineLen", TrInt (length indSpine))]
                 -- Evaluate the constructor's base type
                 let subst = zip (constLevelParameters (ctorConst ctor)) indLvls
                 ctorTypeExpr <- instantiateLevelParamsExpr subst (constType $ ctorConst ctor)
@@ -622,12 +624,12 @@ extractAppArgM idx spine = case drop idx spine of
 -- | Infer the type of a Head, then apply the spine
 inferHeadApp :: Int -> Head -> Spine -> KernelM Value
 inferHeadApp depth head spine = do
-  withTraceNode VLow TInfer (text "inferHeadApp:" <+> ppr head) $ do
+  traceBlock PhInfer TkEnter TraceSummary "infer.headApp" [("depth", TrInt depth), ("head", TrHead head), ("spineLen", TrInt (length spine))] $ do
     -- Get the base type of the Head
     baseType <- case head of
       HLvl _ lvl -> do
         ty <- lookupLocalType lvl
-        traceMsgM VMid TInfer $ text "HLvl base type successfully fetched from context."
+        traceOk PhLookup TkLookup TraceDetail "infer.headApp.local" [("level", TrInt lvl)]
         pure ty
       HConst name lvls -> do
         mInfo <- lookupConstInfo name
@@ -637,20 +639,21 @@ inferHeadApp depth head spine = do
             let subst = zip (constLevelParameters (constantInfoConst info)) lvls
             instTypeExpr <- instantiateLevelParamsExpr subst (constType (constantInfoConst info))
             tyVal <- evalM [] instTypeExpr
-            traceMsgM VMid TInfer $ text "HConst base type successfully evaluated."
+            traceOk PhLookup TkLookup TraceDetail "infer.headApp.const" [("const", TrName name), ("levels", TrDoc (ppr lvls))]
             pure tyVal
           Nothing -> throwError "Unknown constant"
     let baseVal = VNeutral head []
     -- Fold over the spine in reverse order (since innermost arg is last in the list)
     (finalType, _) <- foldM (applyTypeElimAndVal depth) (baseType, baseVal) (reverse spine)
-    traceMsgM VLow TInfer $ text "Successfully applied spine."
+    traceOk PhInfer TkSpine TraceSummary "infer.headApp.spine.ok" [("spineLen", TrInt (length spine))]
     pure finalType
 
 -- | Step through the type by applying eliminations
 applyTypeElimAndVal :: Int -> (Value, Value) -> Elim -> KernelM (Value, Value)
 applyTypeElimAndVal depth (currentType, currentVal) elim = do
   typeWhnf <- force currentType
-  traceMsgM VMid TInfer $ text "applyTypeElim:" <+> ppr currentType <+> ppr elim
+  traceEvent PhInfer TkSpine TraceDetail "infer.typeElim" [("type", TrValueHead currentType), ("elim", TrElim elim)]
+  traceEvent PhInfer TkSpine TraceDump "infer.typeElim.full" [("type", TrValue currentType), ("elim", TrElim elim)]
   case (typeWhnf, elim) of
     -- When the term is applied to an argument, its type must be a Pi.
     -- We evaluate the Pi's closure using the argument.
@@ -687,7 +690,7 @@ applyTypeElimAndVal depth (currentType, currentVal) elim = do
           nextVal <- applyElimM depth currentVal elim
           pure (finalFieldTy, nextVal)
     _ -> do
-      traceMsgM VLow TInfer $ text "Tried to apply" <+> ppr elim <+> text "to a term of type" <+> ppr currentType
+      traceFail PhInfer TkFailure TraceSummary "infer.typeElim.invalid" [("type", TrValueHead currentType), ("elim", TrElim elim)]
       throwError "Type Error: Applied argument to non-function, or projected non-struct"
 
 instantiatePi :: Value -> Value -> KernelM Value
@@ -708,17 +711,17 @@ isDefEq :: HCExpr -> HCExpr -> KernelM Bool
 isDefEq = isDefEq' 0 []
 
 isDefEq' :: Int -> LocalEnv -> HCExpr -> HCExpr -> KernelM Bool
-isDefEq' depth env e1 e2 = withTraceNode VLow TDefEq (text "isDefEq'" <+> "@" <+> ppr depth <+> ppr e1 <+> text "=?=" <+> ppr e2) $ do
+isDefEq' depth env e1 e2 =traceBlock PhDefEq TkCompare TraceSummary "defeq.expr" [("depth", TrInt depth), ("lhs", TrExpr e1), ("rhs", TrExpr e2)] $ do
   failed <- isFailedExprPair e1 e2
   if failed
     then do
-      traceMsgM VLow TDefEq $ red $ text "Previously failed comparison hit, returning False."
+      traceNoProgress PhDefEq TkDecision TraceSummary "defeq.expr.failedCache" [("lhs", TrExpr e1), ("rhs", TrExpr e2)]
       pure False
     else do
       visited <- isVisitedExprPair e1 e2
       if visited
         then do
-          traceMsgM VLow TDefEq $ green $ text "Already visited pair, returning True."
+          traceOk PhDefEq TkDecision TraceSummary "defeq.expr.visited" [("lhs", TrExpr e1), ("rhs", TrExpr e2)]
           pure True
         else do
           success <- withVisitedExprPair e1 e2 (isDefEqExprCore depth env e1 e2)
@@ -726,17 +729,22 @@ isDefEq' depth env e1 e2 = withTraceNode VLow TDefEq (text "isDefEq'" <+> "@" <+
           pure success
 
 isDefEqExprCore :: Int -> LocalEnv -> HCExpr -> HCExpr -> KernelM Bool
-isDefEqExprCore depth env expr1 expr2 = withTraceNode VLow TDefEq (text "isDefEqExprCore" <+> "@" <+> ppr depth <+> ppr expr1 <+> text "=?=" <+> ppr expr2) $ do
-  traceMsgM VHigh TDefEq $ text "LocalEnv is" <+> ppr env
+isDefEqExprCore depth env expr1 expr2 = traceBlock PhDefEq TkCompare TraceDetail "defeq.expr.core" [("depth", TrInt depth), ("lhs", TrExpr expr1), ("rhs", TrExpr expr2), ("envLen", TrInt (length env))] $ do
+  traceEvent PhDefEq TkCompare TraceDump "defeq.expr.env" [("env", TrDoc (ppr env))]
   case () of
     () | expr1 == expr2 -> do
-      traceMsgM VLow TDefEq $ green $ text "Pointer/structural equality hit"
+      traceOk PhDefEq TkCompare TraceSummary "defeq.expr.pointer" []
       pure True
     ()
       | Sort l1 <- hceVal expr1,
         Sort l2 <- hceVal expr2 -> do
-          traceMsgM VMid TDefEq $ text "Checking Sort levels"
-          pure (l1 == l2 || levelEquiv l1 l2)
+          traceEvent PhDefEq TkCompare TraceDetail "defeq.expr.sorts" [("lhs", TrLevel l1), ("rhs", TrLevel l2)]
+          if (l1 == l2 || levelEquiv l1 l2) then do
+            traceOk PhDefEq TkCompare TraceSummary "defeq.expr.sorts.equiv" [("lhs", TrLevel l1), ("rhs", TrLevel l2)]
+            pure True
+          else do
+            traceFail PhDefEq TkCompare TraceSummary "defeq.expr.sorts.notEquiv" [("lhs", TrLevel l1), ("rhs", TrLevel l2)]
+            pure False
     ()
       | Const n1 lvls1 <- hceVal expr1,
         Const n2 lvls2 <- hceVal expr2,
@@ -744,7 +752,7 @@ isDefEqExprCore depth env expr1 expr2 = withTraceNode VLow TDefEq (text "isDefEq
         length lvls1 == length lvls2 ->
           if and (zipWith (\l1 l2 -> l1 == l2 || levelEquiv l1 l2) lvls1 lvls2)
             then do
-              traceMsgM VLow TDefEq $ green $ text "Constants match exactly."
+              traceOk PhDefEq TkCompare TraceSummary "defeq.expr.consts" [("const", TrName n1), ("levels", TrDoc (ppr lvls1))]
               pure True
             else fallbackToWHNF "constant levels do not match."
     ()
@@ -827,13 +835,13 @@ isDefEqExprCore depth env expr1 expr2 = withTraceNode VLow TDefEq (text "isDefEq
     () | otherwise -> fallbackToWHNF "all structural checks failed."
   where
     fallbackToWHNF reason = do
-      traceMsgM VMid TDefEq $ text "Falling back to WHNF comparison:" <+> text reason
+      traceEvent PhDefEq TkFallback TraceDetail "defeq.expr.fallback.whnf" [("reason", TrString reason)]
       val1 <- evalM env expr1
       val2 <- evalM env expr2
       isDefEqValue depth val1 val2
 
 isDefEqSpine :: Int -> Spine -> Spine -> KernelM Bool
-isDefEqSpine depth s1 s2 = withTraceNode VLow TDefEq (text "isDefEqSpine" <+> "@" <+> ppr depth <+> ":" <+> ppr s1 <+> "=?=" <+> ppr s2) $ do
+isDefEqSpine depth s1 s2 = traceBlock PhDefEq TkSpine TraceDetail "defeq.spine" [("depth", TrInt depth), ("lhsLen", TrInt (length s1)), ("rhsLen", TrInt (length s2)), ("orientation", TrString "reversed")] $ do
   if length s1 /= length s2 then pure False else and <$> zipWithM (isDefEqElim depth) s1 s2
 
 isDefEqElim :: Int -> Elim -> Elim -> KernelM Bool
@@ -842,7 +850,7 @@ isDefEqElim _ (EProj _ i1) (EProj _ i2) = pure (i1 == i2)
 isDefEqElim _ _ _ = pure False
 
 checkEta :: Int -> HCName -> Value -> Closure -> Value -> KernelM Bool
-checkEta depth name ty clo otherVal = withTraceNode VLow TEta (text "checkEta" <+> "@" <+> ppr depth) $ do
+checkEta depth name ty clo otherVal = traceBlock PhEta TkCompare TraceDetail "eta.function" [("depth", TrInt depth), ("binder", TrName name), ("other", TrValueHead otherVal)] $ do
   let levelVal = VNeutral (HLvl name depth) []
   let decl = LocalDecl name ty Nothing
   withLocalDecl depth decl $ do
@@ -851,42 +859,42 @@ checkEta depth name ty clo otherVal = withTraceNode VLow TEta (text "checkEta" <
     isDefEqValue (depth + 1) body1 body2
 
 checkStructEta :: Int -> HCName -> Spine -> Value -> KernelM Bool
-checkStructEta depth ctorName spine otherVal = withTraceNode VLow TEta (text "checkStructEta" <+> "@" <+> ppr depth <+> ":" <+> ppr ctorName) $ do
+checkStructEta depth ctorName spine otherVal = traceBlock PhEta TkCompare TraceDetail "eta.structure" [("depth", TrInt depth), ("ctor", TrName ctorName), ("spineLen", TrInt (length spine)), ("other", TrValueHead otherVal)] $ do
   mInfo <- lookupConstInfo ctorName
   case mInfo of
     Just (CtorInfo ctorVal) -> do
       let indName = ctorInductive ctorVal
-      traceMsgM VMid TEta $ text "Found Inductive:" <+> ppr indName
+      traceEvent PhEta TkLookup TraceDetail "eta.structure.inductive" [("ctor", TrName ctorName), ("inductive", TrName indName)]
       mIndInfo <- lookupConstInfo indName
       case mIndInfo of
         Just (InductInfo indVal)
           | length (indCtors indVal) == 1
               && indIndicesN indVal
                 == 0 -> do
-              traceMsgM VMid TEta $ text "Structure verified."
+              traceOk PhEta TkDecision TraceDetail "eta.structure.verified" [("inductive", TrName indName)]
               -- Extract the constructor's field from spine
               -- spine is reversed: [f_n-1, ..., f0, ctorParams...]
               let fieldsN = ctorFieldsN ctorVal
                   ctorFieldsReversed = take fieldsN spine
                   ctorFields = reverse ctorFieldsReversed
-              traceMsgM VMid TEta $ text "Number of fields:" <+> ppr fieldsN
+              traceEvent PhEta TkSpine TraceDetail "eta.structure.fields" [("fields", TrInt fieldsN), ("spineLen", TrInt (length spine))]
               ctorFieldVals <- mapM extractArgM ctorFields
               let projIndices = [0 .. fieldsN - 1]
                   checkField i expectedVal = do
-                    traceMsgM VMid TEta $ text "Checking projection field" <+> ppr i
+                    traceEvent PhEta TkCompare TraceDetail "eta.structure.field" [("field", TrInt i)]
                     projVal <- applyElimM depth otherVal (EProj indName i)
                     isDefEqValue depth expectedVal projVal
               and <$> zipWithM checkField projIndices ctorFieldVals
         _ -> do
-          traceMsgM VLow TEta $ text "Not a structure (indices != 0 or ctors != 1)."
+          traceStuck PhEta TkStuck TraceSummary "eta.structure.notStructure" [("ctor", TrName ctorName), ("inductive", TrName indName)]
           pure False
     _ -> do
-      traceMsgM VLow TEta $ text "Not a constructor."
+      traceStuck PhEta TkStuck TraceSummary "eta.structure.notCtor" [("head", TrName ctorName)]
       pure False
 
 -- | Converts a WHNF Value back into a fully normalized AST
 quote :: Int -> Value -> KernelM HCExpr
-quote depth val = withTraceNode VLow TQuote (text "quote" <+> "@" <+> ppr depth <+> ":" <+> ppr val) $ do
+quote depth val = traceBlock PhQuote TkEnter TraceSummary "quote.value" [("depth", TrInt depth), ("value", TrValueHead val)] $ do
   v <- force val
   case v of
     VSort lvl -> mkSort lvl
@@ -911,7 +919,7 @@ quote depth val = withTraceNode VLow TQuote (text "quote" <+> "@" <+> ppr depth 
       headExpr <- case head of
         HLvl _ fv -> mkBVar (depth - 1 - fv)
         HConst name levels -> mkConst name levels
-      traceMsgM VMid TQuote $ text "Constructed head expression:" <+> ppr head
+      traceEvent PhQuote TkEvent TraceDetail "quote.neutral.head" [("head", TrHead head), ("spineLen", TrInt (length spine))]
       foldM (quoteElim depth) headExpr (reverse spine)
     VDef _ _ _ _ -> throwError "Unreachable: VDef remaining after force"
 

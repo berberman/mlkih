@@ -34,7 +34,7 @@ import Test.Tasty.HUnit
 
 main :: IO ()
 main = do
-  parsed <- loadParsedLeanFixture natAddSuccFixture
+  parsed <- loadParsedLeanFixture tutorialFixture
   (env, checkedInternState) <- expectRight =<< checkParsedExport parsed
   pure ()
 
@@ -273,9 +273,9 @@ withTestContext names buildTypes action = do
   let var nameStr = case elemIndex nameStr names of
         Just lvl -> mkBVar (totalDepth - 1 - lvl)
         Nothing -> throwError $ "Test variable typo: " ++ nameStr
-  typesList <- withVerbosity VSilent [] $ buildTypes var
+  typesList <- buildTypes var
 
-  let go [] _ env = withMaxVerbosity $ action totalDepth env var
+  let go [] _ env = action totalDepth env var
       go ((nameStr, tyExpr) : rest) currentDepth env = do
         tyVal <- evalM finalEnv tyExpr
         let name = hcName [nameStr]

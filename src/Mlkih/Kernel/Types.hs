@@ -50,8 +50,7 @@ type LocalCtx = IntMap LocalDecl
 
 data KernelCtx = KernelCtx
   { checkLocalCtx :: !LocalCtx,
-    checkMaxVerb :: !Verbosity,
-    checkActiveTags :: ![TraceTag]
+    checkTraceConfig :: !TraceConfig
   }
 
 data KernelState = KernelState
@@ -140,8 +139,7 @@ emptyKernelCtx :: KernelCtx
 emptyKernelCtx =
   KernelCtx
     { checkLocalCtx = IntMap.empty,
-      checkMaxVerb = VSilent,
-      checkActiveTags = []
+      checkTraceConfig = defaultTraceConfig
     }
 
 emptyKernelEnv :: KernelEnv
@@ -163,90 +161,535 @@ execKernelM env internSt action = case runKernelM env internSt action of
 
 --------------------------------------------------------------------------------
 
+finallyM :: KernelM a -> KernelM b -> KernelM a
+finallyM action cleanup =
+  catchError
+    ( do
+        r <- action
+        _ <- cleanup
+        pure r
+    )
+    ( \err -> do
+        _ <- cleanup
+        throwError err
+    )
+
+bracketM :: KernelM a -> (a -> KernelM b) -> (a -> KernelM c) -> KernelM c
+bracketM acquire release use = do
+  x <- acquire
+  use x `finallyM` release x
+
+--------------------------------------------------------------------------------
+
+type TraceField = (String, TraceFieldValue)
+
+data TraceFieldValue
+  = TrString String
+  | TrDoc Doc
+  | TrInt Int
+  | TrBool Bool
+  | TrName HCName
+  | TrLevel HCLevel
+  | TrExpr HCExpr
+  | TrValue Value
+  | TrValueHead Value
+  | TrHead Head
+  | TrElim Elim
+  | TrSpine Spine
+  | TrSpineLen Spine
+
+data TraceConfig = TraceConfig
+  { traceVerbosity :: !TraceVerbosity,
+    tracePhases :: !(Maybe [TracePhase]),
+    traceKinds :: !(Maybe [TraceKind]),
+    traceOutcomes :: !(Maybe [TraceOutcome]),
+    traceConstants :: !(Maybe [HCName])
+  }
+
+defaultTraceConfig :: TraceConfig
+defaultTraceConfig =
+  TraceConfig
+    { traceVerbosity = TraceOff,
+      tracePhases = Nothing,
+      traceKinds = Nothing,
+      traceOutcomes = Nothing,
+      traceConstants = Nothing
+    }
+
+maxTraceConfig :: TraceConfig
+maxTraceConfig =
+  TraceConfig
+    { traceVerbosity = TraceDump,
+      tracePhases = Nothing,
+      traceKinds = Nothing,
+      traceOutcomes = Nothing,
+      traceConstants = Nothing
+    }
+
 data TraceNode
-  = TraceMessage Doc
-  | TraceBlock Doc [TraceNode]
-  | TraceError Doc
+  = TraceLeaf TraceEvent
+  | TraceBlock TraceEvent [TraceNode]
 
-data Verbosity
-  = VSilent
-  | VLow
-  | VMid
-  | VHigh
-  deriving (Show, Eq, Ord, Enum, Bounded)
+data TraceEvent = TraceEvent
+  { tracePhase :: !TracePhase,
+    traceKind :: !TraceKind,
+    traceEventVerbosity :: !TraceVerbosity,
+    traceOutcome :: !(Maybe TraceOutcome),
+    traceLabel :: !String,
+    traceFields :: ![TraceField]
+  }
 
-data TraceTag
-  = TEval
-  | TInfer
-  | TDefEq
-  | TEta
-  | TQuote
-  | TMisc
-  deriving (Show, Eq, Ord, Enum, Bounded)
+data TracePhase
+  = PhDecl
+  | PhInfer
+  | PhEval
+  | PhDefEq
+  | PhReduce
+  | PhQuote
+  | PhEta
+  | PhLookup
+  | PhLocalCtx
+  | PhMisc
+  deriving (Eq, Ord, Show)
 
-instance PrettyPrint TraceNode where
-  ppr (TraceMessage d) = green (text "⊢") <+> d
-  ppr (TraceError d) = bold (red (text "✗" <+> d))
-  ppr (TraceBlock name children) =
-    vcat ((bold (blue (text "▼" <+> name))) : map (nest 2 . ppr) children)
+data TraceKind
+  = TkEnter
+  | TkEvent
+  | TkDecision
+  | TkSuccess
+  | TkFailure
+  | TkStuck
+  | TkFallback
+  | TkReduction
+  | TkCompare
+  | TkLookup
+  | TkSpine
+  | TkUnfold
+  | TkForce
+  | TkError
+  deriving (Eq, Ord, Show)
 
-shouldTrace :: Verbosity -> TraceTag -> KernelM Bool
-shouldTrace v tag = do
-  state <- ask
-  pure $ (v <= checkMaxVerb state) && (tag `elem` checkActiveTags state)
+data TraceVerbosity
+  = TraceOff
+  | -- | one-line skeleton
+    TraceSummary
+  | -- | branch decisions
+    TraceDetail
+  | -- | dump large terms/envs/spines
+    TraceDump
+  deriving (Eq, Ord, Show)
 
-traceMsgM :: (PrettyPrint a) => Verbosity -> TraceTag -> a -> KernelM ()
-traceMsgM v tag item = do
-  active <- shouldTrace v tag
-  when active $ modify' $ \s ->
+data TraceOutcome
+  = OutOk
+  | OutFail
+  | OutStuck
+  | OutProgress
+  | OutNoProgress
+  deriving (Eq, Ord, Show)
+
+matchesMaybe :: (Eq a) => Maybe [a] -> a -> Bool
+matchesMaybe Nothing _ = True
+matchesMaybe (Just xs) x = x `elem` xs
+
+matchesOutcome :: Maybe [TraceOutcome] -> Maybe TraceOutcome -> Bool
+matchesOutcome Nothing _ = True
+matchesOutcome (Just _) Nothing = True
+matchesOutcome (Just xs) (Just x) = x `elem` xs
+
+traceFieldNames :: TraceFieldValue -> [HCName]
+traceFieldNames field =
+  case field of
+    TrName n -> [n]
+    TrHead h -> traceHeadNames h
+    TrValueHead v -> traceValueHeadNames v
+    TrValue v -> traceValueHeadNames v
+    TrElim e -> traceElimNames e
+    TrSpine sp -> concatMap traceElimNames sp
+    _ -> []
+
+traceHeadNames :: Head -> [HCName]
+traceHeadNames h =
+  case h of
+    HLvl n _ -> [n]
+    HConst n _ -> [n]
+
+traceElimNames :: Elim -> [HCName]
+traceElimNames e =
+  case e of
+    EApp v -> traceValueHeadNames v
+    EProj n _ -> [n]
+
+traceValueHeadNames :: Value -> [HCName]
+traceValueHeadNames v =
+  case v of
+    VSort {} -> []
+    VLit {} -> []
+    VLam n _ _ _ -> [n]
+    VPi n _ _ _ -> [n]
+    VNeutral h _ -> traceHeadNames h
+    VDef n _ _ _ -> [n]
+
+matchesConstants :: Maybe [HCName] -> TraceEvent -> Bool
+matchesConstants Nothing _ = True
+matchesConstants (Just wanted) ev =
+  let present = concatMap (traceFieldNames . snd) (traceFields ev)
+   in any (`elem` wanted) present
+
+shouldTraceEvent :: TraceEvent -> KernelM Bool
+shouldTraceEvent ev = do
+  cfg <- asks checkTraceConfig
+  pure $
+    traceVerbosity cfg /= TraceOff
+      && traceEventVerbosity ev /= TraceOff
+      && traceEventVerbosity ev <= traceVerbosity cfg
+      && matchesMaybe (tracePhases cfg) (tracePhase ev)
+      && matchesMaybe (traceKinds cfg) (traceKind ev)
+      && matchesOutcome (traceOutcomes cfg) (traceOutcome ev)
+      && matchesConstants (traceConstants cfg) ev
+
+mkTraceEvent ::
+  TracePhase ->
+  TraceKind ->
+  TraceVerbosity ->
+  String ->
+  [TraceField] ->
+  Maybe TraceOutcome ->
+  TraceEvent
+mkTraceEvent phase kind verb label fields outcome =
+  TraceEvent
+    { tracePhase = phase,
+      traceKind = kind,
+      traceEventVerbosity = verb,
+      traceOutcome = outcome,
+      traceLabel = label,
+      traceFields = fields
+    }
+
+appendTraceNode :: TraceNode -> KernelM ()
+appendTraceNode node =
+  modify' $ \s ->
     case checkTraceStack s of
-      (currentLevel : rest) -> s {checkTraceStack = (currentLevel ++ [TraceMessage (ppr item)]) : rest}
-      [] -> s {checkTraceStack = [[TraceMessage (ppr item)]]}
+      current : rest ->
+        s {checkTraceStack = (current ++ [node]) : rest}
+      [] ->
+        s {checkTraceStack = [[node]]}
 
-withTraceNode :: Verbosity -> TraceTag -> Doc -> KernelM a -> KernelM a
-withTraceNode v tag blockDoc action = do
-  active <- shouldTrace v tag
+pushTraceFrame :: KernelM ()
+pushTraceFrame =
+  modify' $ \s -> s {checkTraceStack = [] : checkTraceStack s}
+
+popTraceBlock :: TraceEvent -> KernelM ()
+popTraceBlock ev =
+  modify' $ \s ->
+    case checkTraceStack s of
+      completed : parent : rest ->
+        let block = TraceBlock ev completed
+         in s {checkTraceStack = (parent ++ [block]) : rest}
+      [completed] ->
+        s {checkTraceStack = [[TraceBlock ev completed]]}
+      [] ->
+        s {checkTraceStack = [[TraceBlock ev []]]}
+
+traceEmit :: TraceEvent -> KernelM ()
+traceEmit ev = do
+  active <- shouldTraceEvent ev
+  when active $
+    appendTraceNode (TraceLeaf ev)
+
+traceEvent ::
+  TracePhase ->
+  TraceKind ->
+  TraceVerbosity ->
+  String ->
+  [TraceField] ->
+  KernelM ()
+traceEvent phase kind verb label fields =
+  traceEmit (mkTraceEvent phase kind verb label fields Nothing)
+
+traceOk ::
+  TracePhase ->
+  TraceKind ->
+  TraceVerbosity ->
+  String ->
+  [TraceField] ->
+  KernelM ()
+traceOk phase kind verb label fields =
+  traceEmit (mkTraceEvent phase kind verb label fields (Just OutOk))
+
+traceFail ::
+  TracePhase ->
+  TraceKind ->
+  TraceVerbosity ->
+  String ->
+  [TraceField] ->
+  KernelM ()
+traceFail phase kind verb label fields =
+  traceEmit (mkTraceEvent phase kind verb label fields (Just OutFail))
+
+traceStuck ::
+  TracePhase ->
+  TraceKind ->
+  TraceVerbosity ->
+  String ->
+  [TraceField] ->
+  KernelM ()
+traceStuck phase kind verb label fields =
+  traceEmit (mkTraceEvent phase kind verb label fields (Just OutStuck))
+
+traceProgress ::
+  TracePhase ->
+  TraceKind ->
+  TraceVerbosity ->
+  String ->
+  [TraceField] ->
+  KernelM ()
+traceProgress phase kind verb label fields =
+  traceEmit (mkTraceEvent phase kind verb label fields (Just OutProgress))
+
+traceNoProgress ::
+  TracePhase ->
+  TraceKind ->
+  TraceVerbosity ->
+  String ->
+  [TraceField] ->
+  KernelM ()
+traceNoProgress phase kind verb label fields =
+  traceEmit (mkTraceEvent phase kind verb label fields (Just OutNoProgress))
+
+traceBlock ::
+  TracePhase ->
+  TraceKind ->
+  TraceVerbosity ->
+  String ->
+  [TraceField] ->
+  KernelM a ->
+  KernelM a
+traceBlock phase kind verb label fields action = do
+  let ev0 = mkTraceEvent phase kind verb label fields Nothing
+  active <- shouldTraceEvent ev0
   if not active
     then action
     else do
-      -- Push empty level
-      modify' $ \s -> s {checkTraceStack = [] : checkTraceStack s}
+      pushTraceFrame
+      catchError
+        ( do
+            r <- action
+            let evOk = ev0 {traceOutcome = Just OutOk}
+            popTraceBlock evOk
+            pure r
+        )
+        ( \err -> do
+            let errEv =
+                  mkTraceEvent
+                    phase
+                    TkError
+                    TraceSummary
+                    "error"
+                    [("message", TrString err)]
+                    (Just OutFail)
+            appendTraceNode (TraceLeaf errEv)
+            let evFail = ev0 {traceOutcome = Just OutFail}
+            popTraceBlock evFail
+            throwError err
+        )
 
-      -- Run action catching errors
-      res <-
-        catchError
-          action
-          ( \err -> do
-              modify' $ \s -> case checkTraceStack s of
-                (lvl : rest) -> s {checkTraceStack = (lvl ++ [TraceError (text err)]) : rest}
-                [] -> s
-              throwError err
-          )
+instance PrettyPrint TraceNode where
+  ppr (TraceLeaf ev) = ppTraceLeaf ev
+  ppr (TraceBlock ev children) =
+    vcat $
+      ppTraceBlockHeader ev
+        : map (nest 2 . ppr) children
 
-      -- Pop level and wrap in Block
-      modify' $ \s ->
-        case checkTraceStack s of
-          (completedLevel : parentLevel : rest) ->
-            let block = TraceBlock blockDoc completedLevel
-             in s {checkTraceStack = (parentLevel ++ [block]) : rest}
-          _ -> s
+ppTraceLeaf :: TraceEvent -> Doc
+ppTraceLeaf ev =
+  ppTracePrefix False ev <+> ppTraceEventBody ev
 
-      pure res
+ppTraceBlockHeader :: TraceEvent -> Doc
+ppTraceBlockHeader ev =
+  ppTracePrefix True ev <+> ppTraceEventBody ev
+
+ppTracePrefix :: Bool -> TraceEvent -> Doc
+ppTracePrefix isBlock ev =
+  case traceOutcome ev of
+    Just OutOk ->
+      green (text (if isBlock then "▼" else "✓"))
+    Just OutFail ->
+      bold (red (text (if isBlock then "▼" else "✗")))
+    Just OutStuck ->
+      yellow (text (if isBlock then "▼" else "⊣"))
+    Just OutProgress ->
+      cyan (text (if isBlock then "▼" else "↦"))
+    Just OutNoProgress ->
+      dim (text (if isBlock then "▼" else "·"))
+    Nothing ->
+      if isBlock
+        then bold (blue (text "▼"))
+        else green (text "⊢")
+
+ppTraceEventBody :: TraceEvent -> Doc
+ppTraceEventBody ev =
+  ppTraceMeta ev
+    <+> text (traceLabel ev)
+    <+> ppTraceFields (traceFields ev)
+
+ppTraceMeta :: TraceEvent -> Doc
+ppTraceMeta ev =
+  dim $
+    brackets $
+      ppr (tracePhase ev)
+        <> char '/'
+        <> ppr (traceKind ev)
+        <> char '/'
+        <> ppr (traceEventVerbosity ev)
+        <> ppOutcomeSuffix (traceOutcome ev)
+
+ppOutcomeSuffix :: Maybe TraceOutcome -> Doc
+ppOutcomeSuffix Nothing = text ""
+ppOutcomeSuffix (Just out) =
+  char '/'
+    <> case out of
+      OutOk -> text "ok"
+      OutFail -> text "fail"
+      OutStuck -> text "stuck"
+      OutProgress -> text "progress"
+      OutNoProgress -> text "no-progress"
+
+ppTraceFields :: [TraceField] -> Doc
+ppTraceFields [] = text ""
+ppTraceFields fields =
+  dim (char '{')
+    <> hcatWithComma (map ppr fields)
+    <> dim (char '}')
+
+instance PrettyPrint TraceField where
+  ppr (key, val) = cyan (text key) <> dim (char '=') <> ppTraceFieldValue val
+    where
+      ppTraceFieldValue val =
+        case val of
+          TrString s -> text s
+          TrDoc d -> d
+          TrInt n -> int n
+          TrBool b -> text (show b)
+          TrName n -> ppr n
+          TrLevel l -> ppr l
+          TrExpr e -> ppr e
+          TrValue v -> ppr v
+          TrValueHead v -> ppValueHead v
+          TrHead h -> ppr h
+          TrElim e -> ppr e
+          TrSpine sp -> brackets (hcatWithComma (map ppr sp))
+          TrSpineLen sp -> int (length sp)
+
+ppValueHead :: Value -> Doc
+ppValueHead v =
+  case v of
+    VSort lvl ->
+      yellow (text "Sort") <+> ppr lvl
+    VLit lit ->
+      cyan (text "Lit") <+> ppr lit
+    VLam n _ _ _ ->
+      magenta (text "Lam") <+> ppr n
+    VPi n _ _ _ ->
+      magenta (text "Pi") <+> ppr n
+    VNeutral h sp ->
+      red (text "Neutral")
+        <+> ppr h
+        <+> dim (text "spineLen=" <> int (length sp))
+    VDef n lvls sp _ ->
+      blue (text "Def")
+        <+> ppr n
+        <+> dim (brackets (hcatWithComma (map ppr lvls)))
+        <+> dim (text "spineLen=" <> int (length sp))
+
+instance PrettyPrint TraceVerbosity where
+  ppr v = case v of
+    TraceOff -> text "off"
+    TraceSummary -> text "summary"
+    TraceDetail -> text "detail"
+    TraceDump -> text "dump"
+
+instance PrettyPrint TracePhase where
+  ppr p =
+    case p of
+      PhDecl -> text "decl"
+      PhInfer -> text "infer"
+      PhEval -> text "eval"
+      PhDefEq -> text "defeq"
+      PhReduce -> text "reduce"
+      PhQuote -> text "quote"
+      PhEta -> text "eta"
+      PhLookup -> text "lookup"
+      PhLocalCtx -> text "local"
+      PhMisc -> text "misc"
+
+instance PrettyPrint TraceKind where
+  ppr k =
+    case k of
+      TkEnter -> text "enter"
+      TkEvent -> text "event"
+      TkDecision -> text "decision"
+      TkSuccess -> text "success"
+      TkFailure -> text "failure"
+      TkStuck -> text "stuck"
+      TkFallback -> text "fallback"
+      TkReduction -> text "reduction"
+      TkCompare -> text "compare"
+      TkLookup -> text "lookup"
+      TkSpine -> text "spine"
+      TkUnfold -> text "unfold"
+      TkForce -> text "force"
+      TkError -> text "error"
 
 renderKernelTrace :: KernelState -> Doc
-renderKernelTrace st = case checkTraceStack st of
-  [] -> text "No trace generated."
-  [topLevel] -> vcat (map ppr topLevel)
-  malformedStack ->
-    text "Warning: Malformed trace stack (unclosed blocks)."
-      <> text "\n"
-      <> vcat (map ppr (concat (reverse malformedStack)))
+renderKernelTrace st =
+  case checkTraceStack st of
+    [] ->
+      text "No trace generated."
+    [topLevel] ->
+      vcat (map ppr topLevel)
+    malformedStack ->
+      text "Warning: Malformed trace stack."
+        <> text "\n"
+        <> vcat (map ppr (concat (reverse malformedStack)))
 
-withVerbosity :: Verbosity -> [TraceTag] -> KernelM a -> KernelM a
-withVerbosity v tags action = local (\ctx -> ctx {checkMaxVerb = v, checkActiveTags = tags}) action
+withTraceConfig :: TraceConfig -> KernelM a -> KernelM a
+withTraceConfig cfg =
+  local (\ctx -> ctx {checkTraceConfig = cfg})
 
-withMaxVerbosity :: KernelM a -> KernelM a
-withMaxVerbosity = withVerbosity maxBound [minBound .. maxBound]
+withTraceVerbosity :: TraceVerbosity -> KernelM a -> KernelM a
+withTraceVerbosity verb =
+  local
+    ( \ctx ->
+        let cfg = checkTraceConfig ctx
+         in ctx {checkTraceConfig = cfg {traceVerbosity = verb}}
+    )
+
+withTracePhases :: [TracePhase] -> KernelM a -> KernelM a
+withTracePhases phases =
+  local
+    ( \ctx ->
+        let cfg = checkTraceConfig ctx
+         in ctx {checkTraceConfig = cfg {tracePhases = Just phases}}
+    )
+
+withTraceKinds :: [TraceKind] -> KernelM a -> KernelM a
+withTraceKinds kinds =
+  local
+    ( \ctx ->
+        let cfg = checkTraceConfig ctx
+         in ctx {checkTraceConfig = cfg {traceKinds = Just kinds}}
+    )
+
+withTraceConstants :: [HCName] -> KernelM a -> KernelM a
+withTraceConstants names =
+  local
+    ( \ctx ->
+        let cfg = checkTraceConfig ctx
+         in ctx {checkTraceConfig = cfg {traceConstants = Just names}}
+    )
+
+withFullTrace :: KernelM a -> KernelM a
+withFullTrace = withTraceConfig maxTraceConfig
 
 runKernelWithTraceIO :: KernelEnv -> InternState -> KernelM a -> IO (Either KernelError a, InternState)
 runKernelWithTraceIO env internSt action = do

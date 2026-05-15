@@ -84,27 +84,28 @@ insertAndCheck info = do
 
 insertRaw :: ConstantInfo HCExpr HCLevel -> KernelM ()
 insertRaw info = do
-  traceMsgM VLow TMisc $ text "Inserting declaration:" <+> ppr info
+  traceEvent PhDecl TkEvent TraceDetail "insert.declaration" [("decl", TrName $ constantInfoName info)]
   modifyGlobalEnv $ IntMap.insert (hcnId (constantInfoName info)) info
 
 typecheckInfo :: ConstantInfo HCExpr HCLevel -> KernelM ()
-typecheckInfo info = withTraceNode VLow TMisc (text "typecheckInfo:" <+> ppr info) $ do
+typecheckInfo info = traceBlock PhDecl TkEnter TraceSummary "typecheckInfo" [("decl", TrName $ constantInfoName info)] $ do
   tyExpr <- withIntern $ internExprVal $ constType $ constantInfoConst info
-  traceMsgM VMid TMisc $ text "Inferring sort of declaration's type"
+  traceEvent PhDecl TkEvent TraceDetail "typecheck.declType" [("decl", TrName $ constantInfoName info), ("type", TrExpr tyExpr)]
   tyTypeVal <- inferExpr 0 [] tyExpr
-  traceMsgM VMid TMisc $ text "Checking declaration's type is a valid type"
+  traceEvent PhDecl TkEvent TraceDetail "typecheck.declType.inferred" [("decl", TrName $ constantInfoName info), ("typeVal", TrValue tyTypeVal)]
   _ <- ensureSort tyTypeVal
   case constantInfoBody info of
     Just valExpr -> do
       valExpr' <- withIntern $ internExprVal valExpr
-      traceMsgM VMid TMisc $ text "Inferring type of declaration's body"
+      traceEvent PhDecl TkEvent TraceDetail "typecheck.declBody" [("decl", TrName $ constantInfoName info), ("body", TrExpr valExpr')]
       valTypeVal <- inferExpr 0 [] valExpr'
       expectedTyVal <- evalM [] tyExpr
-      traceMsgM VMid TMisc $ text "Checking declaration's body has expected type"
+      traceEvent PhDecl TkEvent TraceDetail "typecheck.declBody.inferred" [("decl", TrName $ constantInfoName info), ("bodyType", TrValue valTypeVal)]
+      traceEvent PhDecl TkEvent TraceDetail "typecheck.declBody.expected" [("decl", TrName $ constantInfoName info), ("expectedType", TrValue expectedTyVal)]
       isTypeOk <- isDefEqValue 0 valTypeVal expectedTyVal
       if not isTypeOk
         then do
-          traceMsgM VLow TMisc $ text "Type mismatch in declaration body:" <+> ppr valTypeVal <+> text "vs expected" <+> ppr expectedTyVal
+          traceFail PhDecl TkFailure TraceSummary "typecheck.declBody.mismatch" [("decl", TrName $ constantInfoName info), ("bodyType", TrValue valTypeVal), ("expectedType", TrValue expectedTyVal)]
           throwError $ "Type of constant body does not match declared type: " <> show valTypeVal <> " vs " <> show expectedTyVal
         else pure ()
     Nothing -> pure ()

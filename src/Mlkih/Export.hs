@@ -32,7 +32,7 @@ import Mlkih.Decl
 import Mlkih.Env
 import Mlkih.Expr
 import Mlkih.Intern
-import Mlkih.Kernel (KernelError, KernelState (..), addDecls, runKernelM, printKernelTrace, withMaxVerbosity)
+import Mlkih.Kernel (KernelError, KernelState (..), addDecls, printKernelTrace, runKernelM, withFullTrace)
 import Mlkih.Level
 import Mlkih.Name
 import Mlkih.Types
@@ -196,7 +196,7 @@ checkExportFile exportPath = do
 
 checkParsedExport :: ParsedExport -> IO (Either KernelError (KernelEnv, InternState))
 checkParsedExport export = do
-  let (result, state) = runKernelM IntMap.empty (parsedInternState export) $ withMaxVerbosity $ addDecls (parsedDecls export)
+  let (result, state) = runKernelM IntMap.empty (parsedInternState export) $ withFullTrace $ addDecls (parsedDecls export)
   printKernelTrace state
   case result of
     Left kernelErr -> pure $ Left kernelErr
