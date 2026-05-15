@@ -1,10 +1,13 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Mlkih.Kernel.Eval where
 
-import Control.Monad (foldM, unless, zipWithM)
+import Control.Monad (foldM, forM, unless, zipWithM)
 import Control.Monad.Except
+import Control.Monad.Reader (asks)
+import qualified Data.IntMap.Strict as IntMap
 import Mlkih.AST
 import Mlkih.Env
 import Mlkih.Expr
@@ -78,6 +81,31 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
     (VLam _ _ _ (Closure env body), EApp argVal) -> do
       traceMsgM VMid TEval $ text "Beta Reduction: evaluating body with new environment"
       evalM (argVal : env) body
+    (VNeutral (HConst ctorName ctorLvls) spine, EProj structName projIdx) -> do
+      let newSpine = EProj structName projIdx : spine
+          fallback reason = do
+            traceMsgM VLow TEval $ text "Returning stuck Neutral for Proj:" <+> text reason
+            pure $ VNeutral (HConst ctorName ctorLvls) newSpine
+      mIndInfo <- lookupConstInfo structName
+      case mIndInfo of
+        Just (InductInfo indVal) -> do
+          if not (null (indCtors indVal)) && head (indCtors indVal) == ctorName
+            then do
+              let numParams = indParamsN indVal
+                  numFields = length spine - numParams
+                  targetIdx = numFields - 1 - projIdx
+
+              if targetIdx >= 0 && targetIdx < numFields
+                then case spine !! targetIdx of
+                  EApp fieldVal -> do
+                    traceMsgM VMid TEval $ text "Successfully reduced projection!"
+                    pure fieldVal
+                  _ -> fallback "constructor argument is not an EApp"
+                else
+                  fallback "projection index out of bounds"
+            else
+              fallback "head is not the target structure's constructor"
+        _ -> fallback "projection structure inductive not found"
     ((VNeutral (HConst recName recLvls) spine), elim) -> do
       -- Iota
       let newSpine = elim : spine
@@ -125,17 +153,7 @@ applyElimM depth val elim = withTraceNode VLow TEval (text "applyElimM" <+> "@" 
               -- Extract the major premise
               majorVal <- extractAppArgM 0 exactArgs
               forcedMajor <- force majorVal
-              zero <- withIntern $ internName $ Name (Str (simpleName "Nat") "zero")
-              succ <- withIntern $ internName $ Name (Str (simpleName "Nat") "succ")
-              -- Convert literal naturals to their constructor
-              let normalizedMajor = case forcedMajor of
-                    VLit (NatVal 0) ->
-                      VNeutral (HConst zero []) []
-                    VLit (NatVal n)
-                      | n > 0 ->
-                          let predVal = VLit (NatVal (n - 1))
-                           in VNeutral (HConst succ []) [EApp predVal]
-                    _ -> forcedMajor
+              normalizedMajor <- expandLiteralCtor forcedMajor
               case normalizedMajor of
                 VNeutral (HConst ctorName _) ctorSpine -> do
                   -- major premise is ctor
@@ -257,6 +275,8 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
         else traceMsgM VLow TDefEq $ text "Literal mismatch:" <+> ppr lit1 <+> text "vs" <+> ppr lit2
       pure eq
     _ -> do
+      val1 <- expandLiteralCtor val1
+      val2 <- expandLiteralCtor val2
       valType <- inferValue depth val1
       typeOfValType <- inferValue depth valType
       let isProp = case typeOfValType of
@@ -352,11 +372,9 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
                 pure False
               else do
                 traceMsgM VMid TDefEq $ text "Forcing both VDefs simultaneously based on equal hints."
-                withUnfoldingConst n1 $ do
-                  v1' <- thunk1
-                  withUnfoldingConst n2 $ do
-                    v2' <- thunk2
-                    isDefEqValue depth v1' v2'
+                v1' <- thunk1
+                v2' <- thunk2
+                isDefEqValue depth v1' v2'
       (VDef n1 _ _ thunk1, _) -> do
         hint1 <- getDefHints n1
         if hint1 == Opaque
@@ -364,9 +382,8 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
             traceMsgM VLow TDefEq $ red $ text "LHS VDef is opaque. Not unfolding and returning False."
             pure False
           else do
-            withUnfoldingConst n1 $ do
-              v1' <- thunk1
-              isDefEqValue depth v1' v2
+            v1' <- thunk1
+            isDefEqValue depth v1' v2
       (_, VDef n2 _ _ thunk2) -> do
         hint2 <- getDefHints n2
         if hint2 == Opaque
@@ -374,9 +391,8 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
             traceMsgM VLow TDefEq $ red $ text "RHS VDef is opaque. Not unfolding and returning False."
             pure False
           else do
-            withUnfoldingConst n2 $ do
-              v2' <- thunk2
-              isDefEqValue depth v1 v2'
+            v2' <- thunk2
+            isDefEqValue depth v1 v2'
       (VLam n _ ty clo, other) -> checkEta depth n ty clo other
       (other, VLam n _ ty clo) -> checkEta depth n ty clo other
       (VNeutral (HConst c1 _) s1, other) -> do
@@ -392,6 +408,15 @@ isDefEqValue depth val1 val2 = withTraceNode VLow TDefEq ("isDefEqValue" <+> "@"
       _ -> do
         traceMsgM VLow TDefEq $ red $ text "matchCore fallback reached False."
         pure False
+
+reconstructEnv :: Int -> KernelM LocalEnv
+reconstructEnv d = do
+  ctx <- asks checkLocalCtx
+  -- Create a VNeutral for every level from 0 to d-1
+  let mkVal lvl = case IntMap.lookup lvl ctx of
+        Just decl -> pure $ VNeutral (HLvl (localName decl) lvl) []
+        Nothing -> throwError $ "reconstructEnv: no local declaration found for level " ++ show lvl
+  mapM mkVal $ reverse [0 .. d - 1]
 
 inferValue :: Int -> Value -> KernelM Value
 inferValue depth val = withTraceNode VLow TInfer (text "inferValue" <+> "@" <+> int depth <+> ":" <+> ppr val) $ case val of
@@ -421,7 +446,8 @@ inferValue depth val = withTraceNode VLow TInfer (text "inferValue" <+> "@" <+> 
       bodyVal <- evalM (levelVal : closureEnv clo) (closureBody clo)
       bodyTy <- inferValue (depth + 1) bodyVal
       bodyTyExpr <- quote (depth + 1) bodyTy
-      pure $ VPi name bi dom (Closure (closureEnv clo) bodyTyExpr)
+      qenv <- reconstructEnv depth
+      pure $ VPi name bi dom (Closure qenv bodyTyExpr)
   VNeutral head spine -> inferHeadApp depth head spine
   VDef name lvls spine _ -> inferHeadApp depth (HConst name lvls) spine
 
@@ -446,6 +472,21 @@ ensurePi val = withTraceNode VLow TInfer (text "ensurePi:" <+> ppr val) $ do
     _ -> do
       traceMsgM VLow TInfer $ text "Failed: Value is not a Pi (Forall) type"
       throwError "Expected a Pi (Forall) type"
+
+expandLiteralCtor :: Value -> KernelM Value
+expandLiteralCtor v = case v of
+  VLit (NatVal n) -> expandNatLitCtor n
+  _ -> pure v
+
+expandNatLitCtor :: Int -> KernelM Value
+expandNatLitCtor n
+  | n < 0 = throwError "expandNatLitCtor: negative Nat literal"
+  | n == 0 = do
+      zero <- withIntern $ internName $ Name (Str (simpleName "Nat") "zero")
+      pure $ VNeutral (HConst zero []) []
+  | otherwise = do
+      succ <- withIntern $ internName $ Name (Str (simpleName "Nat") "succ")
+      pure $ VNeutral (HConst succ []) [EApp (VLit (NatVal (n - 1)))]
 
 inferExpr :: Int -> LocalEnv -> HCExpr -> KernelM Value
 inferExpr depth env expr = withTraceNode VLow TInfer (text "inferExpr" <+> "@" <+> int depth <+> ":" <+> ppr expr) $ case hceVal expr of
@@ -517,8 +558,9 @@ inferExpr depth env expr = withTraceNode VLow TInfer (text "inferExpr" <+> "@" <
     pure $ VSort imaxLvl
   Let name ty value body nondep -> do
     traceMsgM VMid TInfer $ text "Inferring Let binding type"
-    tyVal <- inferExpr depth env ty
-    _ <- ensureSort tyVal
+    tySort <- inferExpr depth env ty
+    _ <- ensureSort tySort
+    tyVal <- evalM env ty
     valueVal <- evalM env value
     valueTypeVal <- inferValue depth valueVal
     traceMsgM VMid TInfer $ text "Checking value type matches annotated type"

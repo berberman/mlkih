@@ -58,7 +58,6 @@ data KernelState = KernelState
   { checkEnv :: !KernelEnv,
     checkMetadata :: !ValidatedKernelMetadata,
     checkInternState :: !InternState,
-    checkUnfoldStack :: ![HCName],
     checkVisited :: ![(HCId, HCId)],
     checkFailed :: ![(HCId, HCId)],
     checkTraceStack :: ![[TraceNode]]
@@ -132,7 +131,6 @@ emptyKernelState env =
     { checkEnv = env,
       checkMetadata = ValidatedKernelMetadata IntMap.empty IntMap.empty,
       checkInternState = emptyInternState,
-      checkUnfoldStack = [],
       checkVisited = [],
       checkFailed = [],
       checkTraceStack = []
@@ -266,22 +264,6 @@ printKernelTrace st = do
   putStrLn "==============================================\n"
 
 --------------------------------------------------------------------------------
-
-isConstOnUnfoldStack :: HCName -> KernelM Bool
-isConstOnUnfoldStack name = elem name <$> gets checkUnfoldStack
-
-withUnfoldingConst :: HCName -> KernelM Bool -> KernelM Bool
-withUnfoldingConst name action = do
-  seen <- isConstOnUnfoldStack name
-  if seen
-    then do
-      traceMsgM VLow TDefEq $ text "Already unfolding" <+> ppr name <+> text "- skipping and returning False."
-      pure False
-    else do
-      modify' (\s -> s {checkUnfoldStack = name : checkUnfoldStack s})
-      res <- action
-      modify' (\s -> s {checkUnfoldStack = filter (/= name) (checkUnfoldStack s)})
-      pure res
 
 orderedPair :: HCExpr -> HCExpr -> (HCId, HCId)
 orderedPair e1 e2 =

@@ -34,7 +34,7 @@ import Test.Tasty.HUnit
 
 main :: IO ()
 main = do
-  parsed <- loadParsedLeanFixture tutorialFixture
+  parsed <- loadParsedLeanFixture natAddSuccFixture
   (env, checkedInternState) <- expectRight =<< checkParsedExport parsed
   pure ()
 
@@ -58,17 +58,9 @@ testRecursionGuardPreventsLoop = do
   let ((recName, sortExpr, recExpr, stuckExpr, recBody), _internState) = runState build emptyInternState
       env = kernelEnvFromInfos [mkDefinitionInfo sortExpr recName [] (Regular 1) recBody]
 
-  (result, stackAfter) <- runKernelExpectRight env $ do
-    -- Try to prove `rec = 0`.
-    -- The kernel will unfold `rec` to `rec`, hit the stack guard, and cleanly abort.
-    res <- isDefEq recExpr stuckExpr
-
-    -- Verify the stack cleaned up after itself
-    finalStack <- gets checkUnfoldStack
-    pure (res, null finalStack)
+  result <- runKernelExpectRight env $ do isDefEq recExpr stuckExpr
 
   assertEq False result "expected infinite recursion to be intercepted and fail gracefully"
-  assertEq True stackAfter "expected the unfold stack to be completely empty after the attempt"
   where
     build = do
       recName <- internName (rawName ["Loop", "forever"])
