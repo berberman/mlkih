@@ -196,7 +196,7 @@ checkExportFile exportPath = do
 
 checkParsedExport :: ParsedExport -> IO (Either KernelError (KernelEnv, InternState))
 checkParsedExport export = do
-  let (result, state) = runKernelM IntMap.empty (parsedInternState export) $ withFullTrace $ addDecls (parsedDecls export)
+  let (result, state) = runKernelM IntMap.empty (parsedInternState export) $ addDecls (parsedDecls export)
   printKernelTrace state
   case result of
     Left kernelErr -> pure $ Left kernelErr
