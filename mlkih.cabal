@@ -39,7 +39,10 @@ library
     Mlkih.Expr
     Mlkih.Intern
     Mlkih.Kernel
+    Mlkih.Kernel.Cache
     Mlkih.Kernel.Eval
+    Mlkih.Kernel.Monad
+    Mlkih.Kernel.Trace
     Mlkih.Kernel.Types
     Mlkih.Level
     Mlkih.Name

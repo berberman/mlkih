@@ -1,7 +1,6 @@
 module Mlkih.Env where
 
 import Data.IntMap (IntMap)
-import qualified Data.IntMap as IntMap
 import Mlkih.Expr
 import Mlkih.Level
 import Mlkih.Name
@@ -28,6 +27,7 @@ instance PrettyPrint ReducibilityHints where
       Opaque -> text "opaque"
       Abbrev -> text "abbrev"
       Regular n -> text "regular" <+> int n
+
 instance Ord ReducibilityHints where
   compare Abbrev Abbrev = EQ
   compare Abbrev _ = LT
@@ -133,6 +133,18 @@ data ConstantInfo e l
   | RecInfo (RecursorVal e l)
   deriving (Show, Eq, Ord)
 
+constantInfoKindName :: ConstantInfo e l -> String
+constantInfoKindName info =
+  case info of
+    AxiomInfo {} -> "axiom"
+    DefnInfo {} -> "definition"
+    ThmInfo {} -> "theorem"
+    OpaqueInfo {} -> "opaque"
+    QuotInfo {} -> "quot"
+    CtorInfo {} -> "constructor"
+    RecInfo {} -> "recursor"
+    InductInfo {} -> "inductive"
+
 constantInfoName :: ConstantInfo e l -> HCName
 constantInfoName constantInfo =
   case constantInfo of
@@ -178,19 +190,6 @@ constantInfoIsDeltaUnfoldable :: ConstantInfo e l -> Bool
 constantInfoIsDeltaUnfoldable = maybe False (const True) . constantInfoDeltaUnfoldability
 
 type KernelEnv = IntMap (ConstantInfo HCExpr HCLevel)
-
-insertConstantInfo :: ConstantInfo HCExpr HCLevel -> KernelEnv -> Either String KernelEnv
-insertConstantInfo constantInfo env =
-  let name = constantInfoName constantInfo
-      key = hcnId name
-   in case IntMap.lookup key env of
-        Just _ -> Left ("duplicate constant in kernel env: " <> toString name)
-        Nothing -> Right (IntMap.insert key constantInfo env)
-
-insertConstantInfos :: [ConstantInfo HCExpr HCLevel] -> KernelEnv -> Either String KernelEnv
-insertConstantInfos infos env = foldl step (Right env) infos
-  where
-    step acc info = acc >>= insertConstantInfo info
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (ConstantVal e l) where
   ppr constantVal =

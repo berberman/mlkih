@@ -34,17 +34,6 @@ import Mlkih.Level
 import Mlkih.Name
 import Mlkih.Types
 
--- | Interner state for hash-consed syntax.
---
--- * /by id/ is the source of truth for imported nodes and direct lookup.
---   Exported Lean terms already come with canonical ids, and locally created
---   nodes get fresh negative ids so the two spaces never collide.
--- * /by fingerprint/ is only an acceleration structure for the interning
---   functions. It stores candidate ids, not whole nodes, so ownership of the
---   actual nodes stays in the primary IntMaps above.
---
--- Interning never mutates an existing node. If a payload already exists, we
--- reuse its canonical node; otherwise we allocate a fresh local id.
 class HasInternState s where
   getInternState :: s -> InternState
   setInternState :: InternState -> s -> s
@@ -66,6 +55,17 @@ withIntern action = do
 evalIntern :: State InternState a -> InternState -> a
 evalIntern action st = evalState action st
 
+-- | Interner state for hash-consed syntax.
+--
+-- * /by id/ is the source of truth for imported nodes and direct lookup.
+--   Exported Lean terms already come with canonical ids, and locally created
+--   nodes get fresh negative ids so the two spaces never collide.
+-- * /by fingerprint/ is only an acceleration structure for the interning
+--   functions. It stores candidate ids, not whole nodes, so ownership of the
+--   actual nodes stays in the primary IntMaps above.
+--
+-- Interning never mutates an existing node. If a payload already exists, we
+-- reuse its canonical node; otherwise we allocate a fresh local id.
 data InternState = InternState
   { internNextNameId :: !HCId,
     internNextLevelId :: !HCId,

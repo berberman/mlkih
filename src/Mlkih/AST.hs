@@ -13,7 +13,6 @@ module Mlkih.AST
     BinderView (..),
     LetView (..),
     mkBVar,
-    -- mkFVar,
     mkSort,
     mkConst,
     mkApp,
@@ -44,11 +43,11 @@ module Mlkih.AST
     openLetView,
     instantiate1,
     instantiate,
-    abstractFVar,
-    abstractFVars,
     instantiateLevelParams,
     instantiateLevelParamsExpr,
     instantiateLevelParamsLevel,
+    hasLooseBVar,
+    getMajorInduct,
   )
 where
 
@@ -123,9 +122,6 @@ mkLevelParam name = withIntern $ internLevelVal (LVar name)
 
 mkBVar :: (MonadState s m, HasInternState s) => Int -> m HCExpr
 mkBVar idx = withIntern $ internExprVal (BVar idx)
-
--- mkFVar :: (MonadState s m, HasInternState s) => FVarId HCName -> m HCExpr
--- mkFVar fvarId = withIntern $ internExprVal (FVar fvarId)
 
 mkSort :: (MonadState s m, HasInternState s) => HCLevel -> m HCExpr
 mkSort level = withIntern $ internExprVal (Sort level)
@@ -301,9 +297,6 @@ openLetView letView = instantiate1 (letViewValue letView) (letViewBody letView)
 instantiate1 :: (MonadState s m, HasInternState s) => HCExpr -> HCExpr -> m HCExpr
 instantiate1 arg body = instantiateList 0 [arg] body
 
-abstractFVar :: (MonadState s m, HasInternState s) => FVarId HCName -> HCExpr -> m HCExpr
-abstractFVar fvarId body = abstractList 0 [fvarId] body
-
 instantiate :: (MonadState s m, HasInternState s) => [HCExpr] -> HCExpr -> m HCExpr
 instantiate args body
   | null args = pure body
@@ -318,7 +311,6 @@ instantiateList depth args expr =
           let argToApply = args !! (numArgs - 1 - (idx - depth))
           liftLooseBVars 0 depth argToApply
       | otherwise -> mkBVar (idx - numArgs)
-    -- FVar _ -> pure expr
     Sort _ -> pure expr
     Const _ _ -> pure expr
     App fn arg -> do
@@ -345,55 +337,6 @@ instantiateList depth args expr =
   where
     numArgs = length args
 
-abstractFVars :: (MonadState s m, HasInternState s) => [FVarId HCName] -> HCExpr -> m HCExpr
-abstractFVars fvarIds body
-  | null fvarIds = pure body
-  | otherwise = abstractList 0 fvarIds body
-
-abstractList :: (MonadState s m, HasInternState s) => Int -> [FVarId HCName] -> HCExpr -> m HCExpr
-abstractList depth fvarIds expr =
-  case hceVal expr of
-    BVar idx
-      | idx < depth -> pure expr
-      | otherwise -> mkBVar (idx + length fvarIds)
-    -- FVar fv ->
-    --   case elemIndex fv fvarIds of
-    --     Just pos -> mkBVar (depth + pos)
-    --     Nothing -> pure expr
-    Sort _ -> pure expr
-    Const _ _ -> pure expr
-    App fn arg -> do
-      fn' <- abstractList depth fvarIds fn
-      arg' <- abstractList depth fvarIds arg
-      if fn' == fn && arg' == arg
-        then pure expr
-        else mkApp fn' arg'
-    Lam name ty body binderInfo -> do
-      ty' <- abstractList depth fvarIds ty
-      body' <- abstractList (depth + 1) fvarIds body
-      if ty' == ty && body' == body
-        then pure expr
-        else mkLam name ty' body' binderInfo
-    ForallE name ty body binderInfo -> do
-      ty' <- abstractList depth fvarIds ty
-      body' <- abstractList (depth + 1) fvarIds body
-      if ty' == ty && body' == body
-        then pure expr
-        else mkForall name ty' body' binderInfo
-    Lit _ -> pure expr
-    Let name ty value body nondep -> do
-      ty' <- abstractList depth fvarIds ty
-      value' <- abstractList depth fvarIds value
-      body' <- abstractList (depth + 1) fvarIds body
-      if ty' == ty && value' == value && body' == body
-        then pure expr
-        else mkLet name ty' value' body' nondep
-    Proj name idx struct -> do
-      struct' <- abstractList depth fvarIds struct
-      if struct' == struct
-        then pure expr
-        else mkProj name idx struct'
-
 instantiateLevelParams :: (MonadState s m, HasInternState s) => [(HCName, HCLevel)] -> HCExpr -> m HCExpr
 instantiateLevelParams subst = instantiateLevelParamsBy (lookupSubst subst)
 
@@ -412,7 +355,6 @@ instantiateLevelParamsBy :: (MonadState s m, HasInternState s) => (HCName -> May
 instantiateLevelParamsBy subst expr =
   case hceVal expr of
     BVar _ -> pure expr
-    -- FVar _ -> pure expr
     Sort level -> do
       level' <- instantiateLevelParamsLevelBy subst level
       if level' == level then pure expr else mkSort level'
@@ -445,7 +387,6 @@ instantiateLevelParamsExprBy :: (MonadState s m, HasInternState s) => (HCName ->
 instantiateLevelParamsExprBy subst expr =
   case expr of
     BVar idx -> mkBVar idx
-    -- FVar fvarId -> mkFVar fvarId
     Sort level -> mkSort =<< instantiateLevelParamsLevelBy subst level
     Const name levels -> mkConst name =<< traverse (instantiateLevelParamsLevelBy subst) levels
     App fn arg -> do
@@ -490,6 +431,21 @@ instantiateLevelParamsLevelBy subst level =
         Just replacement -> pure replacement
         Nothing -> pure level
 
+hasLooseBVar :: HCExpr -> Bool
+hasLooseBVar = go 0
+  where
+    go cutoff expr =
+      case hceVal expr of
+        BVar idx -> idx >= cutoff
+        Sort _ -> False
+        Const _ _ -> False
+        App fn arg -> go cutoff fn || go cutoff arg
+        Lam _ ty body _ -> go cutoff ty || go (cutoff + 1) body
+        ForallE _ ty body _ -> go cutoff ty || go (cutoff + 1) body
+        Lit _ -> False
+        Let _ ty value body _ -> go cutoff ty || go cutoff value || go (cutoff + 1) body
+        Proj _ _ struct -> go cutoff struct
+
 liftLooseBVars :: (MonadState s m, HasInternState s) => Int -> Int -> HCExpr -> m HCExpr
 liftLooseBVars cutoff delta expr
   | delta == 0 = pure expr
@@ -498,7 +454,6 @@ liftLooseBVars cutoff delta expr
         BVar idx
           | idx < cutoff -> pure expr
           | otherwise -> mkBVar $ idx + delta
-        -- FVar _ -> pure expr
         Sort _ -> pure expr
         Const _ _ -> pure expr
         App fn arg -> do
@@ -532,3 +487,22 @@ liftLooseBVars cutoff delta expr
           if struct' == struct
             then pure expr
             else mkProj name idx struct'
+
+-- | Traverses the Pi binders to find the major premise's inductive name
+getMajorInduct :: HCExpr -> Int -> Maybe HCName
+getMajorInduct typeExpr majorIdx = go majorIdx typeExpr
+  where
+    go 0 expr = case hceVal expr of
+      ForallE _ domain _ _ ->
+        case hceVal (getAppFn domain) of
+          Const indName _ -> Just indName
+          _ -> Nothing
+      Lam _ domain _ _ ->
+        case hceVal (getAppFn domain) of
+          Const indName _ -> Just indName
+          _ -> Nothing
+      _ -> Nothing
+    go n expr = case hceVal expr of
+      ForallE _ _ body _ -> go (n - 1) body
+      Lam _ _ body _ -> go (n - 1) body
+      _ -> Nothing

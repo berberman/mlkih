@@ -11,6 +11,8 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BSC
 import qualified Data.IntMap.Strict as IntMap
 import Data.List (elemIndex, isInfixOf)
+import qualified Data.Map.Strict as Map
+import Data.Maybe (fromJust)
 import qualified Data.Text as Text
 import Mlkih.AST
 import Mlkih.Decl
@@ -34,11 +36,12 @@ import Test.Tasty.HUnit
 
 main :: IO ()
 main = do
-  parsed <- loadParsedLeanFixture tutorialFixture
+  -- defaultMain tests
+
+  parsed <- loadParsedLeanFixture natAddAddAddCommFixture
   (env, checkedInternState) <- expectRight =<< checkParsedExport parsed
   pure ()
 
--- defaultMain tests
 
 testDefEqCacheHits :: IO ()
 testDefEqCacheHits = do
@@ -46,7 +49,7 @@ testDefEqCacheHits = do
     exprA <- mkLit (NatVal 1)
     exprB <- mkLit (NatVal 2)
     _ <- isDefEq exprA exprB
-    failedPopulated <- isFailedExprPair exprA exprB
+    failedPopulated <- Map.member (fromJust $ mkClosedDefEqKey exprA exprB) <$> gets checkClosedDefEqCache
     resultFail <- isDefEq exprA exprB
     pure (resultFail, failedPopulated)
 
@@ -286,15 +289,10 @@ withTestContext names buildTypes action = do
 
   go typesList 0 []
 
+
+
 tests :: TestTree
 tests =
-  testGroup
-    "mlkih"
-    [ testCase "kernel checks generated natAddSuccFixture theorem" testKernelChecksGeneratedNatAddSuccFixtureTheorem
-    ]
-
-tests' :: TestTree
-tests' =
   testGroup
     "mlkih"
     [ testCase "simple beta reduction" testNbESemanticBetaReduction,
