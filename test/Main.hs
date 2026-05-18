@@ -37,10 +37,10 @@ import Test.Tasty.HUnit
 
 main :: IO ()
 main = do
-  defaultMain tests
+  -- defaultMain tests
 
-  -- parsed <- loadParsedLeanFixture natAddAddAddCommFixture
-  -- (env, checkedInternState) <- expectRight =<< checkParsedExport parsed
+  parsed <- loadParsedLeanFixture natAddAddAddCommFixture
+  (env, checkedInternState) <- expectRight =<< checkParsedExport parsed
   -- result <- parseExportFileWithState "export.exported.ndjson"
   -- case result of
     -- Left err -> failWith err

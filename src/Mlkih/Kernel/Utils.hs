@@ -8,7 +8,6 @@ import Mlkih.Kernel.Monad
 import Mlkih.Kernel.Trace
 import Mlkih.Kernel.Types
 import Mlkih.Level
-import Mlkih.Name
 
 --------------------------------------------------------------------------------
 
@@ -32,7 +31,7 @@ expectSingleApp label spine =
           <> show (length spine)
 
 -- | Index into a stored reversed spine and require an application elimination.
--- For @f a b c@, the stored spine is @[c, b, a]@, so index 0 corresponds to the argument @a@.
+-- For @f a b c@, the stored spine is @[c, b, a]@, so index 0 corresponds to the argument @c@.
 indexRevSpineApp :: String -> Int -> Spine -> KernelM Value
 indexRevSpineApp label idx spine
   | idx < 0 =
@@ -206,7 +205,7 @@ inductiveIndexValuesForward indVal spineRev = do
 --------------------------------------------------------------------------------
 
 -- | A parsed constructor application spine.
--- Constructor application in forward order is as: @C fields params@,
+-- Constructor application in forward order is as: @C params fields@,
 -- so the stored spine is: @fieldsRev ++ paramsRev@.
 data ConstructorAppSpine = ConstructorAppSpine
   { ctorFieldsRevPart :: Spine,
@@ -290,17 +289,3 @@ constructorFieldsForRecursor rule ctorSpineRev = do
   (fieldsRev, _) <-
     splitConstructorFieldsRev "recursor.constructorFields" fieldsN ctorSpineRev
   pure fieldsRev
-
---------------------------------------------------------------------------------
-
--- | Reduce a projection from a constructor-headed neutral.
--- Input shape: @VNeutral (HConst ctorName lvls) ctorSpineRev .proj_i@.
--- Note: the projection name is the structure/inductive name, not the constructor name.
-projectConstructorField :: HCName -> Int -> HCName -> Spine -> KernelM Value
-projectConstructorField structName fieldIdx ctorName ctorSpineRev = do
-  (_, ctorVal) <- lookupStructureConstructor structName
-  let expectedCtor = constName (ctorConst ctorVal)
-  when (ctorName /= expectedCtor) $
-    throwError "Head is not the structure constructor"
-  parts <- splitConstructorAppSpine ctorVal ctorSpineRev
-  constructorFieldValue fieldIdx parts

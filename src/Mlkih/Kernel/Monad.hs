@@ -110,8 +110,6 @@ bracketM acquire release use = do
   x <- acquire
   use x `finallyM` release x
 
-------------------------------------------------------------
-
 --------------------------------------------------------------------------------
 
 lookupConstInfo :: HCName -> KernelM (Maybe (ConstantInfo HCExpr HCLevel))

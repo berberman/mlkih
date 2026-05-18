@@ -4,9 +4,10 @@
 
 module Mlkih.Kernel.Eval where
 
-import Control.Monad (foldM, when, zipWithM)
+import Control.Monad (foldM, unless, when, zipWithM)
 import Control.Monad.Except
 import Control.Monad.Reader (asks)
+import Control.Monad.Trans (lift)
 import qualified Data.IntMap.Strict as IntMap
 import Mlkih.AST
 import Mlkih.Env
@@ -81,6 +82,379 @@ evalM env expr = traceBlock PhEval TkEnter TraceDetail "eval.expr" [("expr", TrE
 
 --------------------------------------------------------------------------------
 
+newtype StuckReason = StuckReason String
+  deriving (Show, Eq)
+
+type ReduceM = ExceptT StuckReason KernelM
+
+stuck :: String -> ReduceM a
+stuck = throwError . StuckReason
+
+unlessStuck :: Bool -> String -> ReduceM ()
+unlessStuck cond msg = unless cond (stuck msg)
+
+fromMaybeStuck :: String -> Maybe a -> ReduceM a
+fromMaybeStuck msg = maybe (stuck msg) pure
+
+catchEKernelAsStuck :: KernelM a -> String -> ReduceM a
+catchEKernelAsStuck action reason =
+  ExceptT $ do
+    result <-
+      (Right <$> action) `catchError` \_ ->
+        pure (Left (StuckReason reason))
+    pure result
+
+runReduction ::
+  HCName ->
+  [HCLevel] ->
+  Spine ->
+  ReduceM Value ->
+  KernelM Value
+runReduction headName lvls newSpine attempt = do
+  result <- runExceptT attempt
+  case result of
+    Right v ->
+      pure v
+    Left (StuckReason reason) -> do
+      traceStuck
+        PhReduce
+        TkStuck
+        TraceSummary
+        "neutral.stuck"
+        [ ("head", TrName headName),
+          ("reason", TrString reason),
+          ("spineLen", TrInt (length newSpine))
+        ]
+      pure $ VNeutral (HConst headName lvls) newSpine
+
+--------------------------------------------------------------------------------
+
+reduceNeutralConst ::
+  Int ->
+  HCName ->
+  [HCLevel] ->
+  Spine ->
+  ReduceM Value
+reduceNeutralConst depth headName lvls newSpine = do
+  mInfo <- lift $ lookupConstInfo headName
+  case mInfo of
+    Just (QuotInfo quotVal)
+      | quotKind quotVal == QuotLift ->
+          reduceQuotLift depth headName newSpine
+    Just (RecInfo recVal) ->
+      reduceRecursor depth headName lvls recVal newSpine
+    _ ->
+      stuck "head is not a recursor or quotient lifting constant"
+
+--------------------------------------------------------------------------------
+
+-- | Quotient lifting reduction: @Quot.lift f h (Quot.mk a) = f a@
+--   @newSpine = reverse [alpha, r, beta, f, h, major]@
+reduceQuotLift ::
+  Int ->
+  HCName ->
+  Spine ->
+  ReduceM Value
+reduceQuotLift depth liftName newSpine = do
+  lift $
+    traceEvent
+      PhReduce
+      TkDecision
+      TraceDetail
+      "quot.lift.try"
+      [ ("const", TrName liftName),
+        ("args", TrInt (length newSpine))
+      ]
+
+  unlessStuck
+    (length newSpine >= 6)
+    "not enough arguments for Quot.lift"
+
+  let numExtra = length newSpine - 6
+      extraRev = take numExtra newSpine
+      exactRev = drop numExtra newSpine
+
+  lift $
+    traceEvent
+      PhReduce
+      TkSpine
+      TraceDetail
+      "quot.lift.major"
+      [ ("exactArgs", TrInt (length exactRev)),
+        ("extraArgs", TrInt (length extraRev))
+      ]
+
+  majorVal <- lift $ indexRevSpineApp "quot.lift.major" 0 exactRev
+  forcedMajor <- lift $ force majorVal
+
+  (mkName, mkSpine) <-
+    case forcedMajor of
+      VNeutral (HConst mkName _) mkSpine -> pure (mkName, mkSpine)
+      _ -> stuck "major premise is not a stuck application"
+
+  mMkInfo <- lift $ lookupConstInfo mkName
+  case mMkInfo of
+    Just (QuotInfo mkVal) | quotKind mkVal == QuotMk -> do
+      lift $
+        traceProgress
+          PhReduce
+          TkReduction
+          TraceDetail
+          "quot.lift.reduce"
+          [ ("lift", TrName liftName),
+            ("mk", TrName mkName)
+          ]
+
+      aVal <- lift $ indexRevSpineApp "quot.mk.arg" 0 mkSpine
+      fVal <- lift $ indexRevSpineApp "quot.lift.f" 2 exactRev
+
+      reduced <- lift $ applyElimM depth fVal (EApp aVal)
+      lift $ applyElimsM depth reduced extraRev
+    _ -> stuck "major premise is not Quot.mk"
+
+--------------------------------------------------------------------------------
+
+reduceRecursor ::
+  Int ->
+  HCName ->
+  [HCLevel] ->
+  RecursorVal HCExpr HCLevel ->
+  Spine ->
+  ReduceM Value
+reduceRecursor depth recName recLvls recVal newSpine = do
+  let expected = recursorExpectedArgs recVal
+
+  lift $
+    traceEvent
+      PhReduce
+      TkSpine
+      TraceDetail
+      "recursor.args"
+      [ ("recursor", TrName recName),
+        ("expected", TrInt expected),
+        ("actual", TrInt (length newSpine)),
+        ("params", TrInt (recParamsN recVal)),
+        ("motives", TrInt (recMotivesN recVal)),
+        ("minors", TrInt (recMinorsN recVal)),
+        ("indices", TrInt (recIndicesN recVal))
+      ]
+
+  unlessStuck
+    (length newSpine >= expected)
+    "not enough arguments for recursor"
+
+  recArgs <- lift $ splitRecursorAppSpine recVal newSpine
+
+  lift $
+    traceEvent
+      PhReduce
+      TkForce
+      TraceDetail
+      "recursor.major.force"
+      [("recursor", TrName recName)]
+
+  forcedMajor <- lift $ force (recMajor recArgs)
+  normalizedMajor <- lift $ expandLiteralCtor forcedMajor
+
+  case normalizedMajor of
+    VNeutral (HConst ctorName _) ctorSpine ->
+      reduceRecursorCtor depth recName recLvls recVal recArgs ctorName ctorSpine
+    _
+      | recKRule recVal ->
+          reduceRecursorK depth recName recVal recArgs normalizedMajor
+      | otherwise ->
+          stuck "K-rule not enabled for this recursor"
+
+reduceRecursorCtor ::
+  Int ->
+  HCName ->
+  [HCLevel] ->
+  RecursorVal HCExpr HCLevel ->
+  RecursorAppSpine ->
+  HCName ->
+  Spine ->
+  ReduceM Value
+reduceRecursorCtor depth recName recLvls recVal recArgs ctorName ctorSpine = do
+  lift $
+    traceEvent
+      PhReduce
+      TkDecision
+      TraceDetail
+      "recursor.major.constructor"
+      [ ("recursor", TrName recName),
+        ("ctor", TrName ctorName),
+        ("ctorSpineLen", TrInt (length ctorSpine))
+      ]
+
+  mRule <-
+    lift $
+      (Just <$> lookupValidatedRecursorRule recName ctorName)
+        `catchError` \err -> do
+          traceFail
+            PhReduce
+            TkLookup
+            TraceDetail
+            "recursor.rule.missing"
+            [ ("recursor", TrName recName),
+              ("ctor", TrName ctorName),
+              ("error", TrString err)
+            ]
+          pure Nothing
+
+  rule <- fromMaybeStuck "no matching constructor rule for recursor" mRule
+
+  lift $
+    traceProgress
+      PhReduce
+      TkReduction
+      TraceDetail
+      "recursor.iota"
+      [ ("recursor", TrName recName),
+        ("ctor", TrName ctorName)
+      ]
+
+  fieldsRev <- lift $ constructorFieldsForRecursor rule ctorSpine
+
+  let subst = zip (constLevelParameters (recConst recVal)) recLvls
+
+  rhsExpr <- lift $ instantiateLevelParamsExpr subst (recRhs rule)
+  rhsVal <- lift $ evalM [] rhsExpr
+
+  lift $
+    traceEvent
+      PhReduce
+      TkSpine
+      TraceDetail
+      "recursor.rhs.apply"
+      [ ("ruleArgs", TrInt (length (recRuleArgsRev recArgs))),
+        ("fields", TrInt (length fieldsRev)),
+        ("extra", TrInt (length (recExtraRev recArgs)))
+      ]
+
+  val1 <- lift $ applyElimsM depth rhsVal (recRuleArgsRev recArgs)
+  val2 <- lift $ applyElimsM depth val1 fieldsRev
+  lift $ applyElimsM depth val2 (recExtraRev recArgs)
+
+reduceRecursorK ::
+  Int ->
+  HCName ->
+  RecursorVal HCExpr HCLevel ->
+  RecursorAppSpine ->
+  Value ->
+  ReduceM Value
+reduceRecursorK depth recName recVal recArgs major =
+  ExceptT
+    $ traceBlock
+      PhReduce
+      TkReduction
+      TraceDetail
+      "recursor.k"
+      [("recursor", TrName recName)]
+    $ runExceptT
+    $ do
+      majorType <- lift $ inferValue depth major
+      forcedMajorType <- lift $ force majorType
+      targetInductive <- lift $ lookupValidatedRecursorTargetInductive recName
+
+      case forcedMajorType of
+        VNeutral (HConst indName indLvls) indSpine
+          | indName == targetInductive -> do
+              mInfo <- lift $ lookupConstInfo indName
+              indVal <- case mInfo of
+                Just (InductInfo indVal) -> pure indVal
+                _ -> stuck "failed to lookup inductive"
+
+              reduceKForInductive
+                depth
+                targetInductive
+                indVal
+                indLvls
+                indSpine
+                recVal
+                recArgs
+        _ -> stuck "K-rule reduction not applicable: major premise type is not target inductive"
+
+reduceKForInductive ::
+  Int ->
+  HCName ->
+  InductiveVal HCExpr HCLevel ->
+  [HCLevel] ->
+  Spine ->
+  RecursorVal HCExpr HCLevel ->
+  RecursorAppSpine ->
+  ReduceM Value
+reduceKForInductive depth targetInductive indVal indLvls indSpine recVal recArgs = do
+  indParts <- lift $ splitInductiveAppSpine indVal indSpine
+
+  paramVals <- lift $ appValuesForward "k.params" (indParamsRevPart indParts)
+
+  actualIndexVals <- lift $ appValuesForward "k.actualIndices" (indIndicesRevPart indParts)
+
+  ctorName <- case indCtors indVal of
+    [ctorName] -> pure ctorName
+    _ -> stuck "K-rule expected exactly one constructor"
+
+  mCtorInfo <- lift $ lookupConstInfo ctorName
+  ctorVal <- case mCtorInfo of
+    Just (CtorInfo ctorVal) ->
+      pure ctorVal
+    _ -> stuck "failed to lookup constructor"
+
+  let subst = zip (constLevelParameters (ctorConst ctorVal)) indLvls
+
+  ctorTypeExpr <- lift $ instantiateLevelParamsExpr subst (constType (ctorConst ctorVal))
+  ctorTypeVal <- lift $ evalM [] ctorTypeExpr
+
+  ctorTyAfterParams <- lift $ foldM instantiatePi ctorTypeVal paramVals
+  forcedCtorTy <- lift $ force ctorTyAfterParams
+
+  cSpine <-
+    case forcedCtorTy of
+      VNeutral (HConst indName2 _) cSpine
+        | indName2 == targetInductive -> pure cSpine
+      _ -> stuck "constructor type did not reduce to expected form"
+
+  ctorIndParts <- lift $ splitInductiveAppSpine indVal cSpine
+
+  ctorIndexVals <- lift $ appValuesForward "k.ctorIndices" (indIndicesRevPart ctorIndParts)
+
+  when (length actualIndexVals /= length ctorIndexVals) $
+    lift $
+      throwError "K-rule index arity mismatch"
+
+  indicesMatch <- lift $ and <$> zipWithM (isDefEqValue depth) actualIndexVals ctorIndexVals
+
+  unlessStuck indicesMatch "constructor indices did not match major premise indices"
+
+  minor <- lift $ recursorSingleMinor recVal recArgs
+
+  lift $ applyElimsM depth minor (recExtraRev recArgs)
+
+--------------------------------------------------------------------------------
+
+reduceProjection ::
+  HCName ->
+  Int ->
+  HCName ->
+  Spine ->
+  ReduceM Value
+reduceProjection structName fieldIdx headName ctorSpineRev = do
+  (indVal, ctorVal) <- lookupStructureConstructor structName `catchEKernelAsStuck` "projection structure constructor not found"
+
+  let expectedCtor = constName (ctorConst ctorVal)
+
+  when (headName /= expectedCtor) $
+    stuck "head is not the structure constructor"
+
+  when (indIndicesN indVal /= 0) $
+    stuck "projection iota expected a structure with no indices"
+
+  parts <- splitConstructorAppSpine ctorVal ctorSpineRev `catchEKernelAsStuck` "malformed constructor spine for projection"
+
+  lift $ constructorFieldValue fieldIdx parts
+
+--------------------------------------------------------------------------------
+
 -- | Push an elimination onto a WHNF Value
 applyElimM :: Int -> Value -> Elim -> KernelM Value
 applyElimM depth val elim = traceBlock PhReduce TkReduction TraceSummary "apply.elim" [("depth", TrInt depth), ("value", TrValueHead val), ("elim", TrElim elim)] $
@@ -92,162 +466,13 @@ applyElimM depth val elim = traceBlock PhReduce TkReduction TraceSummary "apply.
     -- Projection reduction
     (VNeutral (HConst ctorName ctorLvls) spine, EProj structName projIdx) -> do
       let newSpine = EProj structName projIdx : spine
-          fallback reason = do
-            traceStuck
-              PhReduce
-              TkStuck
-              TraceSummary
-              "proj.stuck"
-              [ ("ctor", TrName ctorName),
-                ("proj", TrName structName),
-                ("field", TrInt projIdx),
-                ("reason", TrString reason)
-              ]
-            pure $ VNeutral (HConst ctorName ctorLvls) newSpine
-      projectConstructorField structName projIdx ctorName spine `catchError` fallback
+      runReduction ctorName ctorLvls newSpine $
+        reduceProjection structName projIdx ctorName spine
     -- Iota reduction
-    ((VNeutral (HConst recName recLvls) spine), elim) -> do
+    (VNeutral (HConst headName lvls) spine, _) -> do
       let newSpine = elim : spine
-          fallback reason = do
-            traceStuck PhReduce TkStuck TraceSummary "neutral.stuck" [("head", TrName recName), ("reason", TrString reason), ("spineLen", TrInt (length newSpine))]
-            pure $ VNeutral (HConst recName recLvls) newSpine
-      mInfo <- lookupConstInfo recName
-      case mInfo of
-        -- Quotient lifting reduction: Quot.lift f h (Quot.mk a) = f a
-        -- newSpine = reverse [alpha, r, beta, f, h, major]
-        Just (QuotInfo quotVal) | quotKind quotVal == QuotLift -> do
-          traceEvent PhReduce TkDecision TraceDetail "quot.lift.try" [("const", TrName recName), ("args", TrInt (length newSpine))]
-          if length newSpine < 6
-            then fallback "not enough arguments for Quot.lift"
-            else do
-              let numExtra = length newSpine - 6
-                  extraArgs = take numExtra newSpine
-                  exactArgs = drop numExtra newSpine
-              traceEvent PhReduce TkSpine TraceDetail "quot.lift.major" [("exactArgs", TrInt (length exactArgs)), ("extraArgs", TrInt (length extraArgs))]
-              majorVal <- indexRevSpineApp "" 0 exactArgs
-              forcedMajor <- force majorVal
-              case forcedMajor of
-                VNeutral (HConst mkName _) mkSpine -> do
-                  mMkInfo <- lookupConstInfo mkName
-                  case mMkInfo of
-                    Just (QuotInfo mkVal) | quotKind mkVal == QuotMk -> do
-                      traceProgress PhReduce TkReduction TraceDetail "quot.lift.reduce" [("lift", TrName recName), ("mk", TrName mkName)]
-                      -- Quot.mk takes [alpha, r, a]
-                      aVal <- indexRevSpineApp "" 0 mkSpine
-                      fVal <- indexRevSpineApp "" 2 exactArgs
-                      reduced <- applyElimM depth fVal (EApp aVal)
-                      applyElimsM depth reduced extraArgs
-                    _ -> fallback "major premise is not Quot.mk"
-                _ -> fallback "major premise is not a stuck application"
-        -- Recursor reduction
-        Just (RecInfo recVal)
-          | expected <- recursorExpectedArgs recVal,
-            length newSpine >= expected -> do
-              recArgs <- splitRecursorAppSpine recVal newSpine
-              traceEvent PhReduce TkForce TraceDetail "recursor.major.force" [("recursor", TrName recName)]
-              forcedMajor <- force (recMajor recArgs)
-              normalizedMajor <- expandLiteralCtor forcedMajor
-              case normalizedMajor of
-                VNeutral (HConst ctorName _) ctorSpine -> do
-                  traceEvent
-                    PhReduce
-                    TkDecision
-                    TraceDetail
-                    "recursor.major.constructor"
-                    [ ("recursor", TrName recName),
-                      ("ctor", TrName ctorName),
-                      ("ctorSpineLen", TrInt (length ctorSpine))
-                    ]
-                  mRule <-
-                    (Just <$> lookupValidatedRecursorRule recName ctorName)
-                      `catchError` \err -> do
-                        traceFail
-                          PhReduce
-                          TkLookup
-                          TraceDetail
-                          "recursor.rule.missing"
-                          [ ("recursor", TrName recName),
-                            ("ctor", TrName ctorName),
-                            ("error", TrString err)
-                          ]
-                        pure Nothing
-                  case mRule of
-                    Just rule -> do
-                      traceProgress
-                        PhReduce
-                        TkReduction
-                        TraceDetail
-                        "recursor.iota"
-                        [("recursor", TrName recName), ("ctor", TrName ctorName)]
-                      fieldsRev <- constructorFieldsForRecursor rule ctorSpine
-                      let subst = zip (constLevelParameters (recConst recVal)) recLvls
-                      rhsExpr <- instantiateLevelParamsExpr subst (recRhs rule)
-                      rhsVal <- evalM [] rhsExpr
-                      traceEvent
-                        PhReduce
-                        TkSpine
-                        TraceDetail
-                        "recursor.rhs.apply"
-                        [ ("ruleArgs", TrInt (length (recRuleArgsRev recArgs))),
-                          ("fields", TrInt (length fieldsRev)),
-                          ("extra", TrInt (length (recExtraRev recArgs)))
-                        ]
-                      val1 <- applyElimsM depth rhsVal (recRuleArgsRev recArgs)
-                      val2 <- applyElimsM depth val1 fieldsRev
-                      applyElimsM depth val2 (recExtraRev recArgs)
-                    Nothing -> fallback "no matching constructor rule for recursor"
-                _ ->
-                  if recKRule recVal
-                    then traceBlock PhReduce TkReduction TraceDetail "recursor.k" [("recursor", TrName recName)] $ do
-                      traceEvent PhReduce TkDecision TraceDetail "k.try" [("recursor", TrName recName)]
-                      majorType <- inferValue depth normalizedMajor
-                      forcedMajorType <- force majorType
-                      targetInductive <- lookupValidatedRecursorTargetInductive recName
-                      case forcedMajorType of
-                        VNeutral (HConst indName indLvls) indSpine
-                          | indName == targetInductive -> do
-                              mInfo <- lookupConstInfo indName
-                              case mInfo of
-                                Just (InductInfo indVal) -> do
-                                  indParts <- splitInductiveAppSpine indVal indSpine
-                                  paramVals <- appValuesForward "k.params" (indParamsRevPart indParts)
-                                  actualIndexVals <- appValuesForward "k.actualIndices" (indIndicesRevPart indParts)
-                                  case indCtors indVal of
-                                    [ctorName] -> do
-                                      mCtorInfo <- lookupConstInfo ctorName
-                                      case mCtorInfo of
-                                        Just (CtorInfo ctorVal) -> do
-                                          let subst = zip (constLevelParameters (ctorConst ctorVal)) indLvls
-                                          ctorTypeExpr <- instantiateLevelParamsExpr subst (constType (ctorConst ctorVal))
-                                          ctorTypeVal <- evalM [] ctorTypeExpr
-                                          ctorTyAfterParams <- foldM instantiatePi ctorTypeVal paramVals
-                                          forcedCtorTy <- force ctorTyAfterParams
-                                          case forcedCtorTy of
-                                            VNeutral (HConst indName2 _) cSpine | indName2 == targetInductive -> do
-                                              ctorIndParts <- splitInductiveAppSpine indVal cSpine
-                                              ctorIndexVals <- appValuesForward "k.ctorIndices" (indIndicesRevPart ctorIndParts)
-                                              when (length actualIndexVals /= length ctorIndexVals) $
-                                                throwError "K-rule index arity mismatch"
-                                              indicesMatch <-
-                                                and
-                                                  <$> zipWithM
-                                                    (isDefEqValue depth)
-                                                    actualIndexVals
-                                                    ctorIndexVals
-                                              if indicesMatch
-                                                then do
-                                                  minor <- recursorSingleMinor recVal recArgs
-                                                  applyElimsM depth minor (recExtraRev recArgs)
-                                                else
-                                                  fallback "constructor indices did not match major premise indices"
-                                            _ -> fallback "constructor type did not reduce to expected form"
-                                        _ -> fallback "failed to lookup constructor"
-                                    _ -> fallback "K-rule expected exactly one constructor"
-                                _ -> fallback "failed to lookup inductive"
-                        _ -> fallback "K-rule reduction not applicable: major premise type is not a neutral with the target inductive as head"
-                    else fallback "K-rule not enabled for this recursor"
-        Just (RecInfo _) -> fallback "recursor does not have enough arguments for reduction"
-        _ -> fallback "head is not a recursor or quotient lifting constant"
+      runReduction headName lvls newSpine $
+        reduceNeutralConst depth headName lvls newSpine
     ((VNeutral head spine), elim) -> do
       traceEvent PhReduce TkSpine TraceDetail "neutral.spine.push" [("head", TrHead head), ("oldLen", TrInt (length spine)), ("newLen", TrInt (length spine + 1))]
       pure $ VNeutral head (elim : spine)
@@ -438,7 +663,7 @@ reconstructEnv d = do
   -- Create a VNeutral for every level from 0 to d-1
   let mkVal lvl = case IntMap.lookup lvl ctx of
         Just decl -> pure $ VNeutral (HLvl (localName decl) lvl) []
-        Nothing -> throwError $ "reconstructEnv: no local declaration found for level " ++ toString lvl
+        Nothing -> throwError $ "reconstructEnv: no local declaration found for level " ++ show lvl
   mapM mkVal $ reverse [0 .. d - 1]
 
 inferValue :: Int -> Value -> KernelM Value
