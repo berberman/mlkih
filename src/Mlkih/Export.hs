@@ -38,6 +38,7 @@ import Mlkih.Kernel.Trace
 import Mlkih.Level
 import Mlkih.Name
 import Mlkih.Types
+import Numeric.Natural
 import System.IO (IOMode (ReadMode), hIsEOF, withFile)
 
 -- | Parser monad for export decoding.
@@ -78,7 +79,7 @@ data ExprRecord
   | ExprForallE Int Int Int BinderInfo
   | ExprLetE Int Int Int Int Bool
   | ExprProj Int Int Int
-  | ExprNatVal Int
+  | ExprNatVal Natural
   | ExprStrVal Text
   | ExprMData Int
 
@@ -412,7 +413,7 @@ parseExprRecord lineNo obj
       payload <- expectObject (fieldContext lineNo "proj") =<< requiredField obj "proj"
       ensureExactObjectFields lineNo "field 'proj' payload" ["typeName", "idx", "struct"] payload
       ExprProj <$> requiredIntObj lineNo "proj.typeName" "typeName" payload <*> requiredNatObj lineNo "proj.idx" "idx" payload <*> requiredIntObj lineNo "proj.struct" "struct" payload
-  | hasKey "natVal" obj = ExprNatVal <$> requiredNatLikeInt lineNo "natVal" obj
+  | hasKey "natVal" obj = ExprNatVal <$> requiredNatForLit lineNo "natVal" obj
   | hasKey "strVal" obj = ExprStrVal <$> requiredText lineNo "strVal" obj
   | hasKey "mdata" obj = do
       payload <- expectObject (fieldContext lineNo "mdata") =<< requiredField obj "mdata"
@@ -711,18 +712,16 @@ requiredIntPair lineNo field obj = do
     [lhs, rhs] -> pure (lhs, rhs)
     _ -> Left (decorate lineNo ("field '" <> Text.unpack field <> "' must contain exactly two integers"))
 
-requiredNatLikeInt :: Int -> Text -> Object -> Either String Int
-requiredNatLikeInt lineNo field obj = do
+requiredNatForLit :: Int -> Text -> Object -> Either String Natural
+requiredNatForLit lineNo field obj = do
   value <- requiredField obj field
   natValue <- case value of
     String txt ->
       case reads (Text.unpack txt) of
         [(n, "")] -> pure n
         _ -> Left (decorate lineNo ("field '" <> Text.unpack field <> "' must be an integer string"))
-    _ -> parseInt (fieldContext lineNo field) value
-  if natValue < 0
-    then Left (decorate lineNo ("field '" <> Text.unpack field <> "' must be non-negative"))
-    else pure natValue
+    _ -> Left (decorate lineNo ("field '" <> Text.unpack field <> "' must be an integer string"))
+  pure natValue
 
 requiredInt :: Int -> Text -> Object -> Either String Int
 requiredInt lineNo field obj = parseInt (fieldContext lineNo field) =<< requiredField obj field

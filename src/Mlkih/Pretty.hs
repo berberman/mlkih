@@ -23,9 +23,11 @@ module Mlkih.Pretty
     bold,
     dim,
     stripAnsi,
+    nat,
   )
 where
 
+import Numeric.Natural
 import Text.PrettyPrint (Doc, brackets, char, int, parens, render, text, zeroWidthText, (<+>))
 
 class PrettyPrint a where
@@ -79,3 +81,6 @@ stripAnsi [] = []
 stripAnsi ('\ESC' : '[' : rest) = stripAnsi (dropWhile (/= 'm') rest)
 stripAnsi ('m' : rest) = stripAnsi rest
 stripAnsi (c : rest) = c : stripAnsi rest
+
+nat :: Natural -> Doc
+nat = text . show

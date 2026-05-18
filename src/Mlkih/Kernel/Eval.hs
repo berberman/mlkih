@@ -4,7 +4,7 @@
 
 module Mlkih.Kernel.Eval where
 
-import Control.Monad (foldM, zipWithM)
+import Control.Monad (foldM, when, zipWithM)
 import Control.Monad.Except
 import Control.Monad.Reader (asks)
 import qualified Data.IntMap.Strict as IntMap
@@ -16,9 +16,11 @@ import Mlkih.Kernel.Cache
 import Mlkih.Kernel.Monad
 import Mlkih.Kernel.Trace
 import Mlkih.Kernel.Types
+import Mlkih.Kernel.Utils
 import Mlkih.Level
 import Mlkih.Name
 import Mlkih.Pretty
+import Numeric.Natural
 
 --------------------------------------------------------------------------------
 
@@ -77,50 +79,44 @@ evalM env expr = traceBlock PhEval TkEnter TraceDetail "eval.expr" [("expr", TrE
           traceStuck PhEval TkStuck TraceSummary "const.neutral" [("const", TrName name), ("levels", TrDoc (ppr levels))]
           pure $ VNeutral (HConst name levels) []
 
+--------------------------------------------------------------------------------
+
 -- | Push an elimination onto a WHNF Value
 applyElimM :: Int -> Value -> Elim -> KernelM Value
 applyElimM depth val elim = traceBlock PhReduce TkReduction TraceSummary "apply.elim" [("depth", TrInt depth), ("value", TrValueHead val), ("elim", TrElim elim)] $
   case (val, elim) of
+    -- Beta reduction
     (VLam _ _ _ (Closure env body), EApp argVal) -> do
       traceProgress PhReduce TkReduction TraceDetail "beta.reduce" [("arg", TrValueHead argVal)]
       evalM (argVal : env) body
+    -- Projection reduction
     (VNeutral (HConst ctorName ctorLvls) spine, EProj structName projIdx) -> do
       let newSpine = EProj structName projIdx : spine
           fallback reason = do
-            traceStuck PhReduce TkStuck TraceSummary "proj.stuck" [("ctor", TrName ctorName), ("proj", TrName structName), ("field", TrInt projIdx), ("reason", TrString reason)]
+            traceStuck
+              PhReduce
+              TkStuck
+              TraceSummary
+              "proj.stuck"
+              [ ("ctor", TrName ctorName),
+                ("proj", TrName structName),
+                ("field", TrInt projIdx),
+                ("reason", TrString reason)
+              ]
             pure $ VNeutral (HConst ctorName ctorLvls) newSpine
-      mIndInfo <- lookupConstInfo structName
-      case mIndInfo of
-        Just (InductInfo indVal) -> do
-          if not (null (indCtors indVal)) && head (indCtors indVal) == ctorName
-            then do
-              let numParams = indParamsN indVal
-                  numFields = length spine - numParams
-                  targetIdx = numFields - 1 - projIdx
-
-              if targetIdx >= 0 && targetIdx < numFields
-                then case spine !! targetIdx of
-                  EApp fieldVal -> do
-                    traceProgress PhReduce TkReduction TraceDetail "proj.reduce" [("ctor", TrName ctorName), ("proj", TrName structName), ("field", TrInt projIdx)]
-                    pure fieldVal
-                  _ -> fallback "constructor argument is not an EApp"
-                else
-                  fallback "projection index out of bounds"
-            else
-              fallback "head is not the target structure's constructor"
-        _ -> fallback "projection structure inductive not found"
+      projectConstructorField structName projIdx ctorName spine `catchError` fallback
+    -- Iota reduction
     ((VNeutral (HConst recName recLvls) spine), elim) -> do
-      -- Iota
       let newSpine = elim : spine
           fallback reason = do
             traceStuck PhReduce TkStuck TraceSummary "neutral.stuck" [("head", TrName recName), ("reason", TrString reason), ("spineLen", TrInt (length newSpine))]
             pure $ VNeutral (HConst recName recLvls) newSpine
       mInfo <- lookupConstInfo recName
       case mInfo of
+        -- Quotient lifting reduction: Quot.lift f h (Quot.mk a) = f a
+        -- newSpine = reverse [alpha, r, beta, f, h, major]
         Just (QuotInfo quotVal) | quotKind quotVal == QuotLift -> do
           traceEvent PhReduce TkDecision TraceDetail "quot.lift.try" [("const", TrName recName), ("args", TrInt (length newSpine))]
-          -- hardcode quotient lifting reduction: Quot.lift f h (Quot.mk a) = f a
-          -- newSpine = reverse [alpha, r, beta, f, h, major]
           if length newSpine < 6
             then fallback "not enough arguments for Quot.lift"
             else do
@@ -128,7 +124,7 @@ applyElimM depth val elim = traceBlock PhReduce TkReduction TraceSummary "apply.
                   extraArgs = take numExtra newSpine
                   exactArgs = drop numExtra newSpine
               traceEvent PhReduce TkSpine TraceDetail "quot.lift.major" [("exactArgs", TrInt (length exactArgs)), ("extraArgs", TrInt (length extraArgs))]
-              majorVal <- extractAppArgM 0 exactArgs
+              majorVal <- indexRevSpineApp "" 0 exactArgs
               forcedMajor <- force majorVal
               case forcedMajor of
                 VNeutral (HConst mkName _) mkSpine -> do
@@ -137,53 +133,69 @@ applyElimM depth val elim = traceBlock PhReduce TkReduction TraceSummary "apply.
                     Just (QuotInfo mkVal) | quotKind mkVal == QuotMk -> do
                       traceProgress PhReduce TkReduction TraceDetail "quot.lift.reduce" [("lift", TrName recName), ("mk", TrName mkName)]
                       -- Quot.mk takes [alpha, r, a]
-                      aVal <- extractAppArgM 0 mkSpine
-                      fVal <- extractAppArgM 2 exactArgs
+                      aVal <- indexRevSpineApp "" 0 mkSpine
+                      fVal <- indexRevSpineApp "" 2 exactArgs
                       reduced <- applyElimM depth fVal (EApp aVal)
                       applyElimsM depth reduced extraArgs
                     _ -> fallback "major premise is not Quot.mk"
                 _ -> fallback "major premise is not a stuck application"
-        Just (RecInfo recVal) -> do
-          let expectedArgs = recParamsN recVal + recMotivesN recVal + recMinorsN recVal + recIndicesN recVal + 1
-          traceEvent PhReduce TkSpine TraceDetail "recursor.args" [("recursor", TrName recName), ("expected", TrInt expectedArgs), ("actual", TrInt (length newSpine)), ("params", TrInt (recParamsN recVal)), ("motives", TrInt (recMotivesN recVal)), ("minors", TrInt (recMinorsN recVal)), ("indices", TrInt (recIndicesN recVal))]
-          if length newSpine < expectedArgs
-            then fallback "not enough arguments for recursor"
-            else do
-              let numExtra = length newSpine - expectedArgs
-              let extraArgs = take numExtra newSpine
-              let exactArgs = drop numExtra newSpine
+        -- Recursor reduction
+        Just (RecInfo recVal)
+          | expected <- recursorExpectedArgs recVal,
+            length newSpine >= expected -> do
+              recArgs <- splitRecursorAppSpine recVal newSpine
               traceEvent PhReduce TkForce TraceDetail "recursor.major.force" [("recursor", TrName recName)]
-              -- Extract the major premise
-              majorVal <- extractAppArgM 0 exactArgs
-              forcedMajor <- force majorVal
+              forcedMajor <- force (recMajor recArgs)
               normalizedMajor <- expandLiteralCtor forcedMajor
               case normalizedMajor of
                 VNeutral (HConst ctorName _) ctorSpine -> do
-                  -- major premise is ctor
-                  traceEvent PhReduce TkDecision TraceDetail "recursor.major.constructor" [("recursor", TrName recName), ("ctor", TrName ctorName), ("ctorSpineLen", TrInt (length ctorSpine))]
+                  traceEvent
+                    PhReduce
+                    TkDecision
+                    TraceDetail
+                    "recursor.major.constructor"
+                    [ ("recursor", TrName recName),
+                      ("ctor", TrName ctorName),
+                      ("ctorSpineLen", TrInt (length ctorSpine))
+                    ]
                   mRule <-
-                    (Just <$> lookupValidatedRecursorRule recName ctorName) `catchError` \err -> do
-                      traceFail PhReduce TkLookup TraceDetail "recursor.rule.missing" [("recursor", TrName recName), ("ctor", TrName ctorName), ("error", TrString err)]
-                      pure Nothing
+                    (Just <$> lookupValidatedRecursorRule recName ctorName)
+                      `catchError` \err -> do
+                        traceFail
+                          PhReduce
+                          TkLookup
+                          TraceDetail
+                          "recursor.rule.missing"
+                          [ ("recursor", TrName recName),
+                            ("ctor", TrName ctorName),
+                            ("error", TrString err)
+                          ]
+                        pure Nothing
                   case mRule of
                     Just rule -> do
-                      traceProgress PhReduce TkReduction TraceDetail "recursor.iota" [("recursor", TrName recName), ("ctor", TrName ctorName)]
-                      -- Extract the params, motives, and minors
-                      -- exactArgs (reversed AST order): [major, indices..., minors..., motives..., params...]
-                      let paramsMotivesMinors = drop (1 + recIndicesN recVal) exactArgs
-                      -- Extract the constructor's fields
-                      -- ctorSpine (reversed): [fields..., ctorParams...]
-                      let fields = take (recFieldsN rule) ctorSpine
-                      -- Evaluate RHS
+                      traceProgress
+                        PhReduce
+                        TkReduction
+                        TraceDetail
+                        "recursor.iota"
+                        [("recursor", TrName recName), ("ctor", TrName ctorName)]
+                      fieldsRev <- constructorFieldsForRecursor rule ctorSpine
                       let subst = zip (constLevelParameters (recConst recVal)) recLvls
-                      traceEvent PhReduce TkEvent TraceDetail "recursor.rhs.eval" [("recursor", TrName recName), ("ctor", TrName ctorName)]
                       rhsExpr <- instantiateLevelParamsExpr subst (recRhs rule)
                       rhsVal <- evalM [] rhsExpr
-                      traceEvent PhReduce TkSpine TraceDetail "recursor.rhs.apply" [("paramsMotivesMinors", TrInt (length paramsMotivesMinors)), ("fields", TrInt (length fields)), ("extra", TrInt (length extraArgs))]
-                      val1 <- applyElimsM depth rhsVal paramsMotivesMinors
-                      val2 <- applyElimsM depth val1 fields
-                      applyElimsM depth val2 extraArgs
-                    _ -> fallback "no matching constructor rule for recursor"
+                      traceEvent
+                        PhReduce
+                        TkSpine
+                        TraceDetail
+                        "recursor.rhs.apply"
+                        [ ("ruleArgs", TrInt (length (recRuleArgsRev recArgs))),
+                          ("fields", TrInt (length fieldsRev)),
+                          ("extra", TrInt (length (recExtraRev recArgs)))
+                        ]
+                      val1 <- applyElimsM depth rhsVal (recRuleArgsRev recArgs)
+                      val2 <- applyElimsM depth val1 fieldsRev
+                      applyElimsM depth val2 (recExtraRev recArgs)
+                    Nothing -> fallback "no matching constructor rule for recursor"
                 _ ->
                   if recKRule recVal
                     then traceBlock PhReduce TkReduction TraceDetail "recursor.k" [("recursor", TrName recName)] $ do
@@ -194,47 +206,47 @@ applyElimM depth val elim = traceBlock PhReduce TkReduction TraceSummary "apply.
                       case forcedMajorType of
                         VNeutral (HConst indName indLvls) indSpine
                           | indName == targetInductive -> do
-                              traceEvent PhReduce TkDecision TraceDetail "k.major.type.match" [("target", TrName targetInductive), ("indices", TrInt (recIndicesN recVal))]
-                              -- indSpine (reversed): [indices..., params...]
-                              let numIndices = recIndicesN recVal
-                                  actualIndices = take numIndices indSpine
-                                  params = drop numIndices indSpine
                               mInfo <- lookupConstInfo indName
                               case mInfo of
                                 Just (InductInfo indVal) -> do
-                                  let ctorName = head (indCtors indVal) -- K-like types have 1 constructor
-                                  mCtorInfo <- lookupConstInfo ctorName
-                                  case mCtorInfo of
-                                    Just (CtorInfo ctorVal) -> do
-                                      traceEvent PhReduce TkEvent TraceDetail "k.ctor.instantiate" [("ctor", TrName ctorName), ("levels", TrDoc (ppr indLvls))]
-                                      let subst = zip (constLevelParameters (ctorConst ctorVal)) indLvls
-                                      ctorTypeExpr <- instantiateLevelParamsExpr subst (constType (ctorConst ctorVal))
-                                      ctorTypeVal <- evalM [] ctorTypeExpr
-                                      traceEvent PhReduce TkSpine TraceDetail "k.ctor.params" [("params", TrInt (length params))]
-                                      paramVals <- mapM extractArgM (reverse params)
-                                      ctorTyAfterParams <- foldM instantiatePi ctorTypeVal paramVals
-                                      forcedCtorTy <- force ctorTyAfterParams
-                                      case forcedCtorTy of
-                                        VNeutral (HConst indName2 _) cSpine | indName2 == targetInductive -> do
-                                          traceEvent PhReduce TkSpine TraceDetail "k.ctor.indices" [("indices", TrInt numIndices)]
-                                          let cIndices = take numIndices cSpine
-                                          cIndexVals <- mapM extractArgM cIndices
-                                          actualIndexVals <- mapM extractArgM actualIndices
-                                          traceEvent PhDefEq TkCompare TraceDetail "k.indices.compare" [("indices", TrInt numIndices)]
-                                          indicesMatch <- and <$> zipWithM (isDefEqValue depth) actualIndexVals cIndexVals
-                                          if indicesMatch
-                                            then do
-                                              traceProgress PhReduce TkReduction TraceDetail "k.reduce" [("recursor", TrName recName)]
-                                              let minorPremise = exactArgs !! (1 + recIndicesN recVal)
-                                              case minorPremise of
-                                                EApp v -> applyElimsM depth v extraArgs
-                                                _ -> fallback "minor premise is not an application"
-                                            else fallback "constructor indices did not match major premise indices"
-                                        _ -> fallback "constructor type did not reduce to expected form"
-                                    _ -> fallback "failed to lookup constructor"
+                                  indParts <- splitInductiveAppSpine indVal indSpine
+                                  paramVals <- appValuesForward "k.params" (indParamsRevPart indParts)
+                                  actualIndexVals <- appValuesForward "k.actualIndices" (indIndicesRevPart indParts)
+                                  case indCtors indVal of
+                                    [ctorName] -> do
+                                      mCtorInfo <- lookupConstInfo ctorName
+                                      case mCtorInfo of
+                                        Just (CtorInfo ctorVal) -> do
+                                          let subst = zip (constLevelParameters (ctorConst ctorVal)) indLvls
+                                          ctorTypeExpr <- instantiateLevelParamsExpr subst (constType (ctorConst ctorVal))
+                                          ctorTypeVal <- evalM [] ctorTypeExpr
+                                          ctorTyAfterParams <- foldM instantiatePi ctorTypeVal paramVals
+                                          forcedCtorTy <- force ctorTyAfterParams
+                                          case forcedCtorTy of
+                                            VNeutral (HConst indName2 _) cSpine | indName2 == targetInductive -> do
+                                              ctorIndParts <- splitInductiveAppSpine indVal cSpine
+                                              ctorIndexVals <- appValuesForward "k.ctorIndices" (indIndicesRevPart ctorIndParts)
+                                              when (length actualIndexVals /= length ctorIndexVals) $
+                                                throwError "K-rule index arity mismatch"
+                                              indicesMatch <-
+                                                and
+                                                  <$> zipWithM
+                                                    (isDefEqValue depth)
+                                                    actualIndexVals
+                                                    ctorIndexVals
+                                              if indicesMatch
+                                                then do
+                                                  minor <- recursorSingleMinor recVal recArgs
+                                                  applyElimsM depth minor (recExtraRev recArgs)
+                                                else
+                                                  fallback "constructor indices did not match major premise indices"
+                                            _ -> fallback "constructor type did not reduce to expected form"
+                                        _ -> fallback "failed to lookup constructor"
+                                    _ -> fallback "K-rule expected exactly one constructor"
                                 _ -> fallback "failed to lookup inductive"
                         _ -> fallback "K-rule reduction not applicable: major premise type is not a neutral with the target inductive as head"
                     else fallback "K-rule not enabled for this recursor"
+        Just (RecInfo _) -> fallback "recursor does not have enough arguments for reduction"
         _ -> fallback "head is not a recursor or quotient lifting constant"
     ((VNeutral head spine), elim) -> do
       traceEvent PhReduce TkSpine TraceDetail "neutral.spine.push" [("head", TrHead head), ("oldLen", TrInt (length spine)), ("newLen", TrInt (length spine + 1))]
@@ -261,6 +273,8 @@ force :: Value -> KernelM Value
 force v = case v of
   VDef n lvls spine thunk -> traceBlock PhReduce TkForce TraceSummary "force.vdef" [("const", TrName n), ("levels", TrDoc (ppr lvls)), ("spineLen", TrInt (length spine))] $ thunk >>= force
   _ -> pure v
+
+--------------------------------------------------------------------------------
 
 isDefEqValue :: Int -> Value -> Value -> KernelM Bool
 isDefEqValue depth val1 val2 = traceBlock PhDefEq TkCompare TraceSummary "defeq.value" [("depth", TrInt depth), ("lhs", TrValueHead val1), ("rhs", TrValueHead val2)] $ do
@@ -413,6 +427,8 @@ isDefEqValue depth val1 val2 = traceBlock PhDefEq TkCompare TraceSummary "defeq.
         traceFail PhDefEq TkFallback TraceSummary "defeq.noRule" [("lhs", TrValueHead v1), ("rhs", TrValueHead v2)]
         pure False
 
+--------------------------------------------------------------------------------
+
 -- | Reconstructs the semantic environment for a given depth.
 -- This guarantees that when a synthesized Closure is evaluated,
 -- quoted BVars map back to their correct levels.
@@ -486,7 +502,7 @@ expandLiteralCtor v = case v of
   VLit (NatVal n) -> expandNatLitCtor n
   _ -> pure v
 
-expandNatLitCtor :: Int -> KernelM Value
+expandNatLitCtor :: Natural -> KernelM Value
 expandNatLitCtor n
   | n < 0 = throwError "expandNatLitCtor: negative Nat literal"
   | n == 0 = do
@@ -588,49 +604,71 @@ inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" 
         let levelVal = VNeutral (HLvl name depth) []
         withLocalDecl depth decl $ inferExpr (depth + 1) (levelVal : env) body
   Proj projName fieldIdx structExpr -> do
-    traceEvent PhInfer TkEvent TraceDetail "infer.proj.struct" [("proj", TrName projName), ("field", TrInt fieldIdx)]
+    traceEvent
+      PhInfer
+      TkEvent
+      TraceDetail
+      "infer.proj.struct"
+      [("proj", TrName projName), ("field", TrInt fieldIdx)]
+
     structTyVal <- inferExpr depth env structExpr
     forcedStructTy <- force structTyVal
+
     case forcedStructTy of
       VNeutral (HConst indName indLvls) indSpine -> do
-        traceEvent PhInfer TkDecision TraceDetail "infer.proj.inductive" [("inductive", TrName indName), ("field", TrInt fieldIdx)]
-        mInfo <- lookupConstInfo indName
-        case mInfo of
-          Just (InductInfo indVal) -> do
-            ctor <- case indCtors indVal of
-              [ctor] ->
-                lookupConstInfo ctor >>= \c -> case c of
-                  Just (CtorInfo ctorVal) -> pure ctorVal
-                  _ -> throwError "Constructor not found in environment"
-              _ -> throwError "Expected exactly one constructor for projection"
-            if (fieldIdx < 0 || fieldIdx >= ctorFieldsN ctor)
-              then throwError "Field index out of bounds for constructor projection"
-              else do
-                traceEvent PhInfer TkSpine TraceDetail "infer.proj.fieldType" [("ctor", TrName (constName (ctorConst ctor))), ("field", TrInt fieldIdx), ("indSpineLen", TrInt (length indSpine))]
-                -- Evaluate the constructor's base type
-                let subst = zip (constLevelParameters (ctorConst ctor)) indLvls
-                ctorTypeExpr <- instantiateLevelParamsExpr subst (constType $ ctorConst ctor)
-                ctorTypeVal <- evalM [] ctorTypeExpr
-                -- Feed the inductive parameters to the constructor type
-                paramVals <- mapM extractArgM $ reverse indSpine
-                tyAfterParams <- foldM instantiatePi ctorTypeVal paramVals
-                structVal <- evalM env structExpr
-                let prevProjs = [0 .. fieldIdx - 1]
-                prevProjVals <- mapM (applyElimM depth structVal . EProj projName) prevProjs
-                tyAfterProjs <- foldM instantiatePi tyAfterParams prevProjVals
-                (finalFieldTy, _) <- extractPiDomain tyAfterProjs
-                pure finalFieldTy
-          _ -> throwError "Inductive not found in environment for projection"
-      _ -> throwError "Expected an inductive type for projection"
+        structVal <- evalM env structExpr
+        inferProjectionFieldTypeFromInductive
+          depth
+          projName
+          fieldIdx
+          indName
+          indLvls
+          indSpine
+          structVal
+      _ ->
+        throwError "Expected an inductive type for projection"
 
-extractArgM :: Elim -> KernelM Value
-extractArgM (EApp v) = pure v
-extractArgM _ = throwError "Expected an application elimination to extract argument"
+inferProjectionFieldTypeFromInductive ::
+  Int ->
+  HCName ->
+  Int ->
+  HCName ->
+  [HCLevel] ->
+  Spine ->
+  Value ->
+  KernelM Value
+inferProjectionFieldTypeFromInductive depth projName fieldIdx indName indLvls indSpine structVal = do
+  (indVal, ctorVal) <- lookupStructureConstructor indName
 
-extractAppArgM :: Int -> Spine -> KernelM Value
-extractAppArgM idx spine = case drop idx spine of
-  (EApp v : _) -> pure v
-  _ -> throwError "Expected an application elimination at the given index in the spine"
+  when (fieldIdx < 0 || fieldIdx >= ctorFieldsN ctorVal) $
+    throwError "inferProjectionFieldTypeFromInductive: field index out of bounds"
+
+  traceEvent
+    PhInfer
+    TkSpine
+    TraceDetail
+    "infer.proj.fieldType"
+    [ ("inductive", TrName indName),
+      ("ctor", TrName (constName (ctorConst ctorVal))),
+      ("field", TrInt fieldIdx),
+      ("indSpineLen", TrInt (length indSpine))
+    ]
+
+  let subst = zip (constLevelParameters (ctorConst ctorVal)) indLvls
+
+  ctorTypeExpr <- instantiateLevelParamsExpr subst (constType (ctorConst ctorVal))
+  ctorTypeVal <- evalM [] ctorTypeExpr
+
+  paramVals <- inductiveParamValuesForward indVal indSpine
+  tyAfterParams <- foldM instantiatePi ctorTypeVal paramVals
+
+  let prevProjs = [0 .. fieldIdx - 1]
+  prevProjVals <- mapM (applyElimM depth structVal . EProj projName) prevProjs
+
+  tyAfterProjs <- foldM instantiatePi tyAfterParams prevProjVals
+  (finalFieldTy, _) <- extractPiDomain tyAfterProjs
+
+  pure finalFieldTy
 
 -- | Infer the type of a Head, then apply the spine
 inferHeadApp :: Int -> Head -> Spine -> KernelM Value
@@ -675,34 +713,22 @@ applyTypeElimAndVal depth (currentType, currentVal) elim = do
     -- When the term is projected, its type must be the Inductive Type.
     -- We look up the constructor field types.
     (VNeutral (HConst indName indLvls) indSpine, EProj projName fieldIdx) -> do
-      indVal <- lookupInducVal indName
-      ctor <- case indCtors indVal of
-        [ctor] ->
-          lookupConstInfo ctor >>= \c -> case c of
-            Just (CtorInfo ctorVal) -> pure ctorVal
-            _ -> throwError "Constructor not found in environment"
-        _ -> throwError "Expected exactly one constructor for projection"
-      if (fieldIdx < 0 || fieldIdx >= ctorFieldsN ctor)
-        then
-          throwError "Field index out of bounds for constructor projection"
-        else do
-          -- Evaluate the constructor's base type
-          let subst = zip (constLevelParameters (ctorConst ctor)) indLvls
-          ctorTypeExpr <- instantiateLevelParamsExpr subst (constType $ ctorConst ctor)
-          ctorTypeVal <- evalM [] ctorTypeExpr
-          -- Feed the inductive parameters to the constructor type
-          -- indSpine is reversed
-          paramVals <- mapM extractArgM $ reverse indSpine
-          tyAfterParams <- foldM instantiatePi ctorTypeVal paramVals
-          let prevProjs = [0 .. fieldIdx - 1]
-          prevProjVals <- mapM (applyElimM depth currentVal . EProj projName) prevProjs
-          tyAfterProjs <- foldM instantiatePi tyAfterParams prevProjVals
-          (finalFieldTy, _) <- extractPiDomain tyAfterProjs
-          nextVal <- applyElimM depth currentVal elim
-          pure (finalFieldTy, nextVal)
+      finalFieldTy <-
+        inferProjectionFieldTypeFromInductive
+          depth
+          projName
+          fieldIdx
+          indName
+          indLvls
+          indSpine
+          currentVal
+      nextVal <- applyElimM depth currentVal elim
+      pure (finalFieldTy, nextVal)
     _ -> do
       traceFail PhInfer TkFailure TraceSummary "infer.typeElim.invalid" [("type", TrValueHead currentType), ("elim", TrElim elim)]
       throwError "Type Error: Applied argument to non-function, or projected non-struct"
+
+--------------------------------------------------------------------------------
 
 instantiatePi :: Value -> Value -> KernelM Value
 instantiatePi piVal argVal = do
@@ -717,6 +743,8 @@ extractPiDomain piVal = do
   case forced of
     VPi _ _ dom clo -> pure (dom, clo)
     _ -> throwError "Expected Pi type to extract domain"
+
+--------------------------------------------------------------------------------
 
 isDefEq :: HCExpr -> HCExpr -> KernelM Bool
 isDefEq = isDefEq' 0 []
@@ -857,6 +885,8 @@ isDefEqElim depth (EApp v1) (EApp v2) = isDefEqValue depth v1 v2
 isDefEqElim _ (EProj _ i1) (EProj _ i2) = pure (i1 == i2)
 isDefEqElim _ _ _ = pure False
 
+--------------------------------------------------------------------------------
+
 checkEta :: Int -> HCName -> Value -> Closure -> Value -> KernelM Bool
 checkEta depth name ty clo otherVal = traceBlock PhEta TkCompare TraceDetail "eta.function" [("depth", TrInt depth), ("binder", TrName name), ("other", TrValueHead otherVal)] $ do
   let levelVal = VNeutral (HLvl name depth) []
@@ -886,7 +916,7 @@ checkStructEta depth ctorName spine otherVal = traceBlock PhEta TkCompare TraceD
                   ctorFieldsReversed = take fieldsN spine
                   ctorFields = reverse ctorFieldsReversed
               traceEvent PhEta TkSpine TraceDetail "eta.structure.fields" [("fields", TrInt fieldsN), ("spineLen", TrInt (length spine))]
-              ctorFieldVals <- mapM extractArgM ctorFields
+              ctorFieldVals <- mapM (expectApp "") ctorFields
               let projIndices = [0 .. fieldsN - 1]
                   checkField i expectedVal = do
                     traceEvent PhEta TkCompare TraceDetail "eta.structure.field" [("field", TrInt i)]
@@ -899,6 +929,8 @@ checkStructEta depth ctorName spine otherVal = traceBlock PhEta TkCompare TraceD
     _ -> do
       traceStuck PhEta TkStuck TraceSummary "eta.structure.notCtor" [("head", TrName ctorName)]
       pure False
+
+--------------------------------------------------------------------------------
 
 -- | Converts a WHNF Value back into a fully normalized AST
 quote :: Int -> Value -> KernelM HCExpr

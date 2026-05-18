@@ -17,6 +17,7 @@ module Mlkih.Kernel.Monad
     lookupLocalType,
     lookupLocalValue,
     lookupInducVal,
+    lookupStructureConstructor,
     constHasBody,
     constIsDeltaUnfoldable,
     getDefHints,
@@ -136,6 +137,24 @@ lookupInducVal indName = do
   case mInfo of
     Just (InductInfo val) -> pure val
     _ -> throwError "Inductive not found in environment"
+
+lookupStructureConstructor :: HCName -> KernelM (InductiveVal HCExpr HCLevel, ConstructorVal HCExpr HCLevel)
+lookupStructureConstructor indName = do
+  mInfo <- lookupConstInfo indName
+  case mInfo of
+    Just (InductInfo indVal) ->
+      case indCtors indVal of
+        [ctorName] -> do
+          mCtorInfo <- lookupConstInfo ctorName
+          case mCtorInfo of
+            Just (CtorInfo ctorVal) ->
+              pure (indVal, ctorVal)
+            _ ->
+              throwError "Constructor not found"
+        _ ->
+          throwError "Expected exactly one constructor"
+    _ ->
+      throwError "Inductive not found"
 
 constHasBody :: HCName -> KernelM Bool
 constHasBody name = maybe False constantInfoHasBody <$> lookupConstInfo name

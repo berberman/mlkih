@@ -10,14 +10,15 @@ import Mlkih.Level
 import Mlkih.Name
 import Mlkih.Pretty
 import Mlkih.Types
+import Numeric.Natural
 
-data Literal = NatVal Int | StrVal String
+data Literal = NatVal Natural | StrVal String
   deriving (Show, Eq, Ord)
 
 instance PrettyPrint Literal where
   ppr literal =
     case literal of
-      NatVal n -> cyan (int n)
+      NatVal n -> cyan (nat n)
       StrVal s -> yellow (text (show s))
 
 instance Hashable Literal where

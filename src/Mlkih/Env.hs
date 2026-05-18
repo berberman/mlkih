@@ -15,10 +15,14 @@ data ConstantVal e l = ConstantVal
 
 type AxiomVal = ConstantVal
 
+--------------------------------------------------------------------------------
+
 data ReducibilityHints
   = Opaque
   | Abbrev
-  | Regular Int
+  | -- | Height of this definition.
+    -- If both two definitions are regular, the one with larger height will be unfolded first.
+    Regular Int
   deriving (Show, Eq)
 
 instance PrettyPrint ReducibilityHints where
@@ -28,6 +32,7 @@ instance PrettyPrint ReducibilityHints where
       Abbrev -> text "abbrev"
       Regular n -> text "regular" <+> int n
 
+-- | Smaller hints (larger heights) are unfolded first.
 instance Ord ReducibilityHints where
   compare Abbrev Abbrev = EQ
   compare Abbrev _ = LT
@@ -36,6 +41,8 @@ instance Ord ReducibilityHints where
   compare (Regular _) Opaque = LT
   compare Opaque Opaque = EQ
   compare Opaque _ = GT
+
+--------------------------------------------------------------------------------
 
 data DefinitionVal e l = DefinitionVal
   { defConst :: ConstantVal e l,
@@ -58,13 +65,26 @@ data OpaqueVal e l = OpaqueVal
 
 data InductiveVal e l = InductiveVal
   { indConst :: ConstantVal e l,
+    -- | Number of parameters
     indParamsN :: Int,
+    -- | Number of indices
     indIndicesN :: Int,
+    -- | List the name of the constructors for this inductive type
     indCtors :: [HCName]
   }
   deriving (Show, Eq, Ord)
 
-data QuotKind = Quot | QuotMk | QuotLift | QuotInd
+--------------------------------------------------------------------------------
+
+data QuotKind
+  = -- | @Quot@
+    Quot
+  | -- | @Quot.mk@
+    QuotMk
+  | -- | @Quot.lift@
+    QuotLift
+  | -- | @Quot.ind@
+    QuotInd
   deriving (Show, Eq, Ord, Enum)
 
 instance PrettyPrint QuotKind where
@@ -81,6 +101,8 @@ data QuotVal e l = QuotVal
   }
   deriving (Show, Eq, Ord)
 
+--------------------------------------------------------------------------------
+
 data ConstructorVal e l = ConstructorVal
   { ctorConst :: ConstantVal e l,
     -- | Inductive type that this constructor belongs to
@@ -93,6 +115,8 @@ data ConstructorVal e l = ConstructorVal
     ctorFieldsN :: Int
   }
   deriving (Show, Eq, Ord)
+
+--------------------------------------------------------------------------------
 
 data RecursorRule e l = RecursorRule
   { -- | Constructor that this rule corresponds to
@@ -121,6 +145,28 @@ data RecursorVal e l = RecursorVal
     recRules :: [RecursorRule e l]
   }
   deriving (Show, Eq, Ord)
+
+recursorFirstMotiveIdx :: RecursorVal e l -> Int
+recursorFirstMotiveIdx v =
+  recParamsN v
+
+recursorFirstMinorIdx :: RecursorVal e l -> Int
+recursorFirstMinorIdx v =
+  recParamsN v + recMotivesN v
+
+recursorFirstIndexIdx :: RecursorVal e l -> Int
+recursorFirstIndexIdx v =
+  recParamsN v + recMotivesN v + recMinorsN v
+
+recursorMajorIdx :: RecursorVal e l -> Int
+recursorMajorIdx v =
+  recParamsN v + recMotivesN v + recMinorsN v + recIndicesN v
+
+recursorExpectedArgs :: RecursorVal e l -> Int
+recursorExpectedArgs v =
+  recursorMajorIdx v + 1
+
+--------------------------------------------------------------------------------
 
 data ConstantInfo e l
   = AxiomInfo (AxiomVal e l)
@@ -189,7 +235,11 @@ constantInfoDeltaUnfoldability constantInfo =
 constantInfoIsDeltaUnfoldable :: ConstantInfo e l -> Bool
 constantInfoIsDeltaUnfoldable = maybe False (const True) . constantInfoDeltaUnfoldability
 
+--------------------------------------------------------------------------------
+
 type KernelEnv = IntMap (ConstantInfo HCExpr HCLevel)
+
+--------------------------------------------------------------------------------
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (ConstantVal e l) where
   ppr constantVal =
