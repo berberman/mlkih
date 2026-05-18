@@ -119,6 +119,11 @@ levelEquiv lhs rhs =
       rhs' = simplifyHCLevel rhs
    in levelLeq lhs' rhs' 0 && levelLeq rhs' lhs' 0
 
+levelsEquiv :: [HCLevel] -> [HCLevel] -> Bool
+levelsEquiv lvls1 lvls2 =
+  length lvls1 == length lvls2
+    && and (zipWith (\l1 l2 -> l1 == l2 || levelEquiv l1 l2) lvls1 lvls2)
+
 levelGeq :: HCLevel -> HCLevel -> Bool
 levelGeq lhs rhs = levelLeq (simplifyHCLevel rhs) (simplifyHCLevel lhs) 0
 

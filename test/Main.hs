@@ -40,12 +40,16 @@ main = do
   -- defaultMain tests
 
   parsed <- loadParsedLeanFixture natAddAddAddCommFixture
-  (env, checkedInternState) <- expectRight =<< checkParsedExport parsed
+  state <- expectRightKernel $ checkParsedExport parsed
+  printKernelTrace state
   -- result <- parseExportFileWithState "export.exported.ndjson"
   -- case result of
-    -- Left err -> failWith err
-    -- Right parsed -> pure ()
+  -- Left err -> failWith err
+  -- Right parsed -> pure ()
   pure ()
+
+expectRightKernel :: KernelM a -> IO KernelState
+expectRightKernel k = expectRight $ execKernelM' k
 
 testDefEqCacheHits :: IO ()
 testDefEqCacheHits = do
@@ -357,7 +361,9 @@ testGeneratedLeanDeclAlignment = do
 testKernelChecksGeneratedNatAddSuccFixtureTheorem :: IO ()
 testKernelChecksGeneratedNatAddSuccFixtureTheorem = do
   parsed <- loadParsedLeanFixture natAddSuccFixture
-  (env, checkedInternState) <- expectRight =<< checkParsedExport parsed
+  state <- expectRightKernel $ checkParsedExport parsed
+  let env = checkEnv state
+      checkedInternState = checkInternState state
   theoremDecl <-
     case findTheorem "natAddSuccFixture" (parsedDecls parsed) of
       Just (ThmDecl thm) -> pure thm
@@ -569,9 +575,9 @@ loadParsedLeanFixture fixture = do
 loadCheckedLeanFixture :: LeanFixture -> IO (KernelEnv, InternState)
 loadCheckedLeanFixture fixture = do
   exportPath <- generateLeanExport fixture
-  result <- checkExportFile exportPath
   -- removeFile exportPath
-  expectRight result
+  state <- expectRightKernel =<< checkExportFile exportPath
+  pure (checkEnv state, checkInternState state)
 
 generateLeanExport :: LeanFixture -> IO FilePath
 generateLeanExport fixture = do

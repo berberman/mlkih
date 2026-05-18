@@ -501,6 +501,19 @@ force v = case v of
 
 --------------------------------------------------------------------------------
 
+isPropType :: Int -> Value -> KernelM Bool
+isPropType depth ty = do
+  tyType <- inferValue depth ty
+  forcedTyType <- force tyType
+  zero <- mkLevelZero
+  case forcedTyType of
+    VSort lvl ->
+      pure (lvl == zero || levelEquiv lvl zero)
+    _ ->
+      pure False
+
+--------------------------------------------------------------------------------
+
 isDefEqValue :: Int -> Value -> Value -> KernelM Bool
 isDefEqValue depth val1 val2 = traceBlock PhDefEq TkCompare TraceSummary "defeq.value" [("depth", TrInt depth), ("lhs", TrValueHead val1), ("rhs", TrValueHead val2)] $ do
   traceEvent PhDefEq TkCompare TraceDump "defeq.value.full" [("lhs", TrValue val1), ("rhs", TrValue val2)]
@@ -585,17 +598,19 @@ isDefEqValue depth val1 val2 = traceBlock PhDefEq TkCompare TraceSummary "defeq.
         | h1 == h2 -> do
             traceEvent PhDefEq TkSpine TraceDetail "defeq.neutral.sameHead" [("head", TrHead h1), ("lhsLen", TrInt (length s1)), ("rhsLen", TrInt (length s2))]
             isDefEqSpine depth s1 s2
-      (VDef n1 _ s1 _, VDef n2 _ s2 _) | n1 == n2 -> do
-        match <- isDefEqSpine depth s1 s2 `catchError` \_ -> pure False
-        if match
-          then do
-            traceOk PhDefEq TkCompare TraceSummary "defeq.vdef.sameHeadSpine" [("const", TrName n1), ("spineLen", TrInt (length s1))]
-            pure True
-          else do
-            traceEvent PhDefEq TkForce TraceDetail "defeq.vdef.sameHead.diffSpine" [("const", TrName n1)]
-            v1' <- force v1
-            v2' <- force v2
-            isDefEqValue depth v1' v2'
+      (VDef n1 lvls1 s1 _, VDef n2 lvls2 s2 _)
+        | n1 == n2,
+          levelsEquiv lvls1 lvls2 -> do
+            match <- isDefEqSpine depth s1 s2 `catchError` \_ -> pure False
+            if match
+              then do
+                traceOk PhDefEq TkCompare TraceSummary "defeq.vdef.sameHeadSpine" [("const", TrName n1), ("spineLen", TrInt (length s1))]
+                pure True
+              else do
+                traceEvent PhDefEq TkForce TraceDetail "defeq.vdef.sameHead.diffSpine" [("const", TrName n1)]
+                v1' <- force v1
+                v2' <- force v2
+                isDefEqValue depth v1' v2'
       (VDef n1 _ _ thunk1, VDef n2 _ _ thunk2) -> do
         hint1 <- getDefHints n1
         hint2 <- getDefHints n2
@@ -1009,9 +1024,8 @@ isDefEqExprCore depth env expr1 expr2 = traceBlock PhDefEq TkCompare TraceDetail
     ()
       | Const n1 lvls1 <- hceVal expr1,
         Const n2 lvls2 <- hceVal expr2,
-        n1 == n2,
-        length lvls1 == length lvls2 ->
-          if and (zipWith (\l1 l2 -> l1 == l2 || levelEquiv l1 l2) lvls1 lvls2)
+        n1 == n2 ->
+          if levelsEquiv lvls1 lvls2
             then do
               traceOk PhDefEq TkCompare TraceSummary "defeq.expr.consts" [("const", TrName n1), ("levels", TrDoc (ppr lvls1))]
               pure True
@@ -1107,7 +1121,7 @@ isDefEqSpine depth s1 s2 = traceBlock PhDefEq TkSpine TraceDetail "defeq.spine" 
 
 isDefEqElim :: Int -> Elim -> Elim -> KernelM Bool
 isDefEqElim depth (EApp v1) (EApp v2) = isDefEqValue depth v1 v2
-isDefEqElim _ (EProj _ i1) (EProj _ i2) = pure (i1 == i2)
+isDefEqElim _ (EProj n1 i1) (EProj n2 i2) = pure (n1 == n2 && i1 == i2)
 isDefEqElim _ _ _ = pure False
 
 --------------------------------------------------------------------------------
@@ -1135,13 +1149,13 @@ checkStructEta depth ctorName spine otherVal = traceBlock PhEta TkCompare TraceD
               && indIndicesN indVal
                 == 0 -> do
               traceOk PhEta TkDecision TraceDetail "eta.structure.verified" [("inductive", TrName indName)]
-              -- Extract the constructor's field from spine
-              -- spine is reversed: [f_n-1, ..., f0, ctorParams...]
               let fieldsN = ctorFieldsN ctorVal
-                  ctorFieldsReversed = take fieldsN spine
-                  ctorFields = reverse ctorFieldsReversed
+              (fieldsRev, _) <- splitConstructorFieldsRev "eta.structure.fields" fieldsN spine
+              let ctorFields = reverse fieldsRev
               traceEvent PhEta TkSpine TraceDetail "eta.structure.fields" [("fields", TrInt fieldsN), ("spineLen", TrInt (length spine))]
-              ctorFieldVals <- mapM (expectApp "") ctorFields
+              ctorFieldVals <- mapM (expectApp "eta.structure.field") ctorFields
+              when (length ctorFieldVals /= fieldsN) $
+                throwError "eta.structure: field arity mismatch"
               let projIndices = [0 .. fieldsN - 1]
                   checkField i expectedVal = do
                     traceEvent PhEta TkCompare TraceDetail "eta.structure.field" [("field", TrInt i)]

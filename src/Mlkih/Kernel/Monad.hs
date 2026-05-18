@@ -7,6 +7,7 @@ module Mlkih.Kernel.Monad
     runKernelM,
     evalKernelM,
     execKernelM,
+    execKernelM',
     finallyM,
     bracketM,
     emptyKernelEnv,
@@ -80,6 +81,9 @@ execKernelM :: KernelEnv -> InternState -> KernelM a -> Either KernelError Kerne
 execKernelM env internSt action = case runKernelM env internSt action of
   (Left err, _) -> Left err
   (Right _, st) -> Right st
+
+execKernelM' :: KernelM a -> Either KernelError KernelState
+execKernelM' action = execKernelM emptyKernelEnv emptyInternState action
 
 runKernelWithTraceIO :: KernelEnv -> InternState -> KernelM a -> IO (Either KernelError a, InternState)
 runKernelWithTraceIO env internSt action = do

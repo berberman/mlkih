@@ -13,13 +13,14 @@ module Mlkih.Export
 where
 
 import Control.Monad (foldM, unless, when)
+import Control.Monad.Error.Class (throwError)
+import Control.Monad.State.Strict (put)
 import Data.Aeson (Object, Value (..), eitherDecodeStrict')
 import Data.Aeson.Key (Key, fromText, toText)
 import qualified Data.Aeson.KeyMap as KeyMap
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BSC
-import qualified Data.IntMap.Strict as IntMap
 import Data.List (sortOn)
 import Data.Maybe (mapMaybe)
 import Data.Scientific (toBoundedInteger)
@@ -32,9 +33,9 @@ import Mlkih.Decl
 import Mlkih.Env
 import Mlkih.Expr
 import Mlkih.Intern
-import Mlkih.Kernel (KernelState (..), addDecls)
+import Mlkih.Kernel (addDecls)
 import Mlkih.Kernel.Monad
-import Mlkih.Kernel.Trace
+import Mlkih.Kernel.Types (KernelState (..))
 import Mlkih.Level
 import Mlkih.Name
 import Mlkih.Types
@@ -190,20 +191,17 @@ parseExportWithState input = do
 parseExportFile :: FilePath -> IO (Either String [Decl HCExpr HCLevel])
 parseExportFile path = fmap (fmap parsedDecls) (parseExportFileWithState path)
 
-checkExportFile :: FilePath -> IO (Either KernelError (KernelEnv, InternState))
+checkExportFile :: FilePath -> IO (KernelM ())
 checkExportFile exportPath = do
   parseResult <- parseExportFileWithState exportPath
-  case parseResult of
-    Left err -> pure $ Left err
+  pure $ case parseResult of
+    Left err -> throwError err
     Right parsedExport -> checkParsedExport parsedExport
 
-checkParsedExport :: ParsedExport -> IO (Either KernelError (KernelEnv, InternState))
+checkParsedExport :: ParsedExport -> KernelM ()
 checkParsedExport export = do
-  let (result, state) = runKernelM IntMap.empty (parsedInternState export) $ withTraceVerbosity TraceDetail $ withTracePhases [PhDecl] $ addDecls (parsedDecls export)
-  printKernelTrace state
-  case result of
-    Left kernelErr -> pure $ Left kernelErr
-    Right _ -> pure $ Right (checkEnv state, checkInternState state)
+  put (emptyKernelState emptyKernelEnv) {checkInternState = parsedInternState export}
+  addDecls (parsedDecls export)
 
 parseExportFileWithState :: FilePath -> IO (Either String ParsedExport)
 parseExportFileWithState path = withFile path ReadMode loop
