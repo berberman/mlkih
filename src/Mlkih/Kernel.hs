@@ -235,7 +235,7 @@ typecheckInfo info =
         [ ("decl", TrName (constantInfoName info)),
           ("typeVal", TrValueHead tyTypeVal)
         ]
-      _ <- ensureSort tyTypeVal
+      _ <- ensureSort 0 tyTypeVal
       checkBodyIfPresent info tyExpr
 
 checkBodyIfPresent ::

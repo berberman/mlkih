@@ -37,11 +37,11 @@ import Test.Tasty.HUnit
 
 main :: IO ()
 main = do
-  -- defaultMain tests
+  defaultMain tests
 
-  parsed <- loadParsedLeanFixture natAddAddAddCommFixture
-  state <- expectRightKernel $ checkParsedExport parsed
-  printKernelTrace state
+  -- parsed <- loadParsedLeanFixture tutorialFixture
+  -- state <- expectRightKernel $ withTraceVerbosity TraceSummary  $ withFullTrace $ checkParsedExport parsed
+  -- printKernelTrace state
   -- result <- parseExportFileWithState "export.exported.ndjson"
   -- case result of
   -- Left err -> failWith err

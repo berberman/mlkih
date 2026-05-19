@@ -68,14 +68,16 @@ evalM env expr = traceBlock PhEval TkEnter TraceDetail "eval.expr" [("expr", TrE
       traceEvent PhLookup TkLookup TraceDetail "const.lookup" [("const", TrName name)]
       mInfo <- lookupConstInfo name
       case mInfo of
-        Just (DefnInfo def) -> do
-          traceEvent PhEval TkUnfold TraceDetail "const.def.lazy" [("const", TrName name), ("levels", TrDoc (ppr levels))]
-          let subst = zip (constLevelParameters (defConst def)) levels
-          -- Eagerly substitute universes
-          instantiatedBody <- instantiateLevelParamsExpr subst (defValue def)
-          -- Suspend the evaluation of the body
-          let lazyThunk = evalM [] instantiatedBody
-          pure $ VDef name levels [] lazyThunk
+        Just (DefnInfo _) -> do
+          traceEvent
+            PhEval
+            TkUnfold
+            TraceDetail
+            "const.def.delay"
+            [ ("const", TrName name),
+              ("levels", TrDoc (ppr levels))
+            ]
+          pure $ VDef name levels []
         _ -> do
           traceStuck PhEval TkStuck TraceSummary "const.neutral" [("const", TrName name), ("levels", TrDoc (ppr levels))]
           pure $ VNeutral (HConst name levels) []
@@ -185,10 +187,10 @@ reduceQuotLift depth liftName newSpine = do
       ]
 
   majorVal <- lift $ indexRevSpineApp "quot.lift.major" 0 exactRev
-  forcedMajor <- lift $ force majorVal
+  whnfMajor <- lift $ whnf depth majorVal
 
   (mkName, mkSpine) <-
-    case forcedMajor of
+    case whnfMajor of
       VNeutral (HConst mkName _) mkSpine -> pure (mkName, mkSpine)
       _ -> stuck "major premise is not a stuck application"
 
@@ -248,13 +250,13 @@ reduceRecursor depth recName recLvls recVal newSpine = do
   lift $
     traceEvent
       PhReduce
-      TkForce
+      TkWHNF
       TraceDetail
-      "recursor.major.force"
+      "recursor.major.whnf"
       [("recursor", TrName recName)]
 
-  forcedMajor <- lift $ force (recMajor recArgs)
-  normalizedMajor <- lift $ expandLiteralCtor forcedMajor
+  whnfMajor <- lift $ whnf depth (recMajor recArgs)
+  normalizedMajor <- lift $ expandLiteralCtor whnfMajor
 
   case normalizedMajor of
     VNeutral (HConst ctorName _) ctorSpine ->
@@ -353,10 +355,10 @@ reduceRecursorK depth recName recVal recArgs major =
     $ runExceptT
     $ do
       majorType <- lift $ inferValue depth major
-      forcedMajorType <- lift $ force majorType
+      whnfMajorType <- lift $ whnf depth majorType
       targetInductive <- lift $ lookupValidatedRecursorTargetInductive recName
 
-      case forcedMajorType of
+      case whnfMajorType of
         VNeutral (HConst indName indLvls) indSpine
           | indName == targetInductive -> do
               mInfo <- lift $ lookupConstInfo indName
@@ -405,11 +407,11 @@ reduceKForInductive depth targetInductive indVal indLvls indSpine recVal recArgs
   ctorTypeExpr <- lift $ instantiateLevelParamsExpr subst (constType (ctorConst ctorVal))
   ctorTypeVal <- lift $ evalM [] ctorTypeExpr
 
-  ctorTyAfterParams <- lift $ foldM instantiatePi ctorTypeVal paramVals
-  forcedCtorTy <- lift $ force ctorTyAfterParams
+  ctorTyAfterParams <- lift $ foldM (instantiatePi depth) ctorTypeVal paramVals
+  whnfCtorTy <- lift $ whnf depth ctorTyAfterParams
 
   cSpine <-
-    case forcedCtorTy of
+    case whnfCtorTy of
       VNeutral (HConst indName2 _) cSpine
         | indName2 == targetInductive -> pure cSpine
       _ -> stuck "constructor type did not reduce to expected form"
@@ -476,14 +478,10 @@ applyElimM depth val elim = traceBlock PhReduce TkReduction TraceSummary "apply.
     ((VNeutral head spine), elim) -> do
       traceEvent PhReduce TkSpine TraceDetail "neutral.spine.push" [("head", TrHead head), ("oldLen", TrInt (length spine)), ("newLen", TrInt (length spine + 1))]
       pure $ VNeutral head (elim : spine)
-    ((VDef name levels spine thunk), elim) -> do
+    ((VDef name levels spine), elim) -> do
       traceEvent PhReduce TkSpine TraceDetail "vdef.spine.push" [("const", TrName name), ("oldLen", TrInt (length spine)), ("newLen", TrInt (length spine + 1))]
       let newSpine = elim : spine
-      -- To prevent forcing the thunk immediately, we wrap the application in a new thunk
-      let newThunk = do
-            forcedBody <- thunk
-            applyElimM depth forcedBody elim
-      pure $ VDef name levels newSpine newThunk
+      pure $ VDef name levels newSpine
     _ -> do
       traceFail PhReduce TkFailure TraceSummary "apply.illtyped" [("value", TrValueHead val), ("elim", TrElim elim)]
       throwError "Ill-typed application"
@@ -493,20 +491,180 @@ applyElimsM depth baseVal spine =
   traceBlock PhReduce TkSpine TraceDetail "spine.apply.rev" [("depth", TrInt depth), ("base", TrValueHead baseVal), ("spineLen", TrInt (length spine))] $
     foldM (applyElimM depth) baseVal (reverse spine)
 
--- | Force a VDef thunk
-force :: Value -> KernelM Value
-force v = case v of
-  VDef n lvls spine thunk -> traceBlock PhReduce TkForce TraceSummary "force.vdef" [("const", TrName n), ("levels", TrDoc (ppr lvls)), ("spineLen", TrInt (length spine))] $ thunk >>= force
+unfoldVDefOne :: Int -> HCName -> [HCLevel] -> Spine -> KernelM Value
+unfoldVDefOne depth name levels spineRev =
+  traceBlock
+    PhDefEq
+    TkUnfold
+    TraceDetail
+    "defeq.vdef.unfold.one"
+    [ ("const", TrName name),
+      ("levels", TrDoc (ppr levels)),
+      ("spineLen", TrInt (length spineRev))
+    ]
+    $ do
+      mInfo <- lookupConstInfo name
+      case mInfo of
+        Just (DefnInfo def) -> do
+          let subst = zip (constLevelParameters (defConst def)) levels
+          bodyExpr <- instantiateLevelParamsExpr subst (defValue def)
+          bodyVal <- evalM [] bodyExpr
+          applyElimsM depth bodyVal spineRev
+        _ ->
+          throwError $ "unfoldVDefOne: VDef head is not a transparent definition: " <> toString name
+
+unfoldVDefsByHint :: Int -> Value -> Value -> KernelM Bool
+unfoldVDefsByHint depth lhs rhs =
+  case (lhs, rhs) of
+    (VDef n1 lvls1 s1, VDef n2 lvls2 s2) -> do
+      hint1 <- getDefHints n1
+      hint2 <- getDefHints n2
+      case hint1 `compare` hint2 of
+        LT -> do
+          if hint1 == Opaque
+            then do
+              traceFail
+                PhDefEq
+                TkUnfold
+                TraceSummary
+                "defeq.vdef.opaque.lhs"
+                [("const", TrName n1)]
+              pure False
+            else do
+              traceEvent
+                PhDefEq
+                TkUnfold
+                TraceDetail
+                "defeq.vdef.unfold.lhs"
+                [ ("const", TrName n1),
+                  ("hint", TrDoc (ppr hint1))
+                ]
+              lhs' <- unfoldVDefOne depth n1 lvls1 s1
+              isDefEqValue depth lhs' rhs
+        GT -> do
+          if hint2 == Opaque
+            then do
+              traceFail
+                PhDefEq
+                TkUnfold
+                TraceSummary
+                "defeq.vdef.opaque.rhs"
+                [("const", TrName n2)]
+              pure False
+            else do
+              traceEvent
+                PhDefEq
+                TkUnfold
+                TraceDetail
+                "defeq.vdef.unfold.rhs"
+                [ ("const", TrName n2),
+                  ("hint", TrDoc (ppr hint2))
+                ]
+              rhs' <- unfoldVDefOne depth n2 lvls2 s2
+              isDefEqValue depth lhs rhs'
+        EQ -> do
+          if hint1 == Opaque
+            then do
+              traceFail
+                PhDefEq
+                TkUnfold
+                TraceSummary
+                "defeq.vdef.opaque.both"
+                [ ("lhs", TrName n1),
+                  ("rhs", TrName n2)
+                ]
+              pure False
+            else do
+              traceEvent
+                PhDefEq
+                TkUnfold
+                TraceDetail
+                "defeq.vdef.unfold.both"
+                [ ("lhs", TrName n1),
+                  ("rhs", TrName n2),
+                  ("hint", TrDoc (ppr hint1))
+                ]
+              lhs' <- unfoldVDefOne depth n1 lvls1 s1
+              rhs' <- unfoldVDefOne depth n2 lvls2 s2
+              isDefEqValue depth lhs' rhs'
+    (VDef n lvls s, _) -> do
+      hint <- getDefHints n
+      if hint == Opaque
+        then do
+          traceFail
+            PhDefEq
+            TkUnfold
+            TraceSummary
+            "defeq.vdef.opaque.lhs"
+            [("const", TrName n)]
+          pure False
+        else do
+          traceEvent
+            PhDefEq
+            TkUnfold
+            TraceDetail
+            "defeq.vdef.unfold.lhs"
+            [ ("const", TrName n),
+              ("hint", TrDoc (ppr hint))
+            ]
+          lhs' <- unfoldVDefOne depth n lvls s
+          isDefEqValue depth lhs' rhs
+    (_, VDef n lvls s) -> do
+      hint <- getDefHints n
+      if hint == Opaque
+        then do
+          traceFail
+            PhDefEq
+            TkUnfold
+            TraceSummary
+            "defeq.vdef.opaque.rhs"
+            [("const", TrName n)]
+          pure False
+        else do
+          traceEvent
+            PhDefEq
+            TkUnfold
+            TraceDetail
+            "defeq.vdef.unfold.rhs"
+            [ ("const", TrName n),
+              ("hint", TrDoc (ppr hint))
+            ]
+          rhs' <- unfoldVDefOne depth n lvls s
+          isDefEqValue depth lhs rhs'
+    _ -> error "unfoldVDefsByHint called without VDef"
+
+-- | Expose the weak-head form of a semantic value.
+--
+-- This only has work to do for 'VDef'. Other 'Value' constructors are treated
+-- as already head-exposed by kernel convention.
+--
+-- This convention relies on applications/projections being built through
+-- 'applyElimM', which attempts beta/iota/projection reductions before
+-- constructing stuck neutrals.
+whnf :: Int -> Value -> KernelM Value
+whnf depth v = case v of
+  VDef name lvls spineRev -> do
+    traceBlock
+      PhReduce
+      TkWHNF
+      TraceSummary
+      "whnf.vdef"
+      [ ("const", TrName name),
+        ("spineLen", TrInt (length spineRev))
+      ]
+      $ do
+        v' <- unfoldVDefOne depth name lvls spineRev
+        whnf depth v'
   _ -> pure v
 
 --------------------------------------------------------------------------------
 
 isPropType :: Int -> Value -> KernelM Bool
 isPropType depth ty = do
-  tyType <- inferValue depth ty
-  forcedTyType <- force tyType
+  tySort <- inferValue depth ty
+  whnfTySort <- whnf depth tySort
   zero <- mkLevelZero
-  case forcedTyType of
+  case whnfTySort of
     VSort lvl ->
       pure (lvl == zero || levelEquiv lvl zero)
     _ ->
@@ -598,59 +756,26 @@ isDefEqValue depth val1 val2 = traceBlock PhDefEq TkCompare TraceSummary "defeq.
         | h1 == h2 -> do
             traceEvent PhDefEq TkSpine TraceDetail "defeq.neutral.sameHead" [("head", TrHead h1), ("lhsLen", TrInt (length s1)), ("rhsLen", TrInt (length s2))]
             isDefEqSpine depth s1 s2
-      (VDef n1 lvls1 s1 _, VDef n2 lvls2 s2 _)
-        | n1 == n2,
-          levelsEquiv lvls1 lvls2 -> do
-            match <- isDefEqSpine depth s1 s2 `catchError` \_ -> pure False
-            if match
-              then do
-                traceOk PhDefEq TkCompare TraceSummary "defeq.vdef.sameHeadSpine" [("const", TrName n1), ("spineLen", TrInt (length s1))]
-                pure True
-              else do
-                traceEvent PhDefEq TkForce TraceDetail "defeq.vdef.sameHead.diffSpine" [("const", TrName n1)]
-                v1' <- force v1
-                v2' <- force v2
-                isDefEqValue depth v1' v2'
-      (VDef n1 _ _ thunk1, VDef n2 _ _ thunk2) -> do
-        hint1 <- getDefHints n1
-        hint2 <- getDefHints n2
-        case compare hint1 hint2 of
-          LT -> do
-            traceEvent PhDefEq TkUnfold TraceDetail "defeq.vdef.unfold.lhs" [("const", TrName n1), ("hint", TrDoc (ppr hint1))]
-            v1' <- thunk1
-            isDefEqValue depth v1' v2
-          GT -> do
-            traceEvent PhDefEq TkUnfold TraceDetail "defeq.vdef.unfold.rhs" [("const", TrName n2), ("hint", TrDoc (ppr hint2))]
-            v2' <- thunk2
-            isDefEqValue depth v1 v2'
-          EQ -> do
-            if hint1 == Opaque
-              then do
-                traceFail PhDefEq TkUnfold TraceSummary "defeq.vdef.opaque.both" [("lhs", TrName n1), ("rhs", TrName n2)]
-                pure False
-              else do
-                traceEvent PhDefEq TkUnfold TraceDetail "defeq.vdef.unfold.both" [("lhs", TrName n1), ("rhs", TrName n2), ("hint", TrDoc (ppr hint1))]
-                v1' <- thunk1
-                v2' <- thunk2
-                isDefEqValue depth v1' v2'
-      (VDef n1 _ _ thunk1, _) -> do
-        hint1 <- getDefHints n1
-        if hint1 == Opaque
+      (VDef n1 lvls1 s1, VDef n2 lvls2 s2) -> do
+        sameHeadAndSpine <-
+          if n1 == n2 && levelsEquiv lvls1 lvls2
+            then isDefEqSpine depth s1 s2 `catchError` \_ -> pure False
+            else pure False
+        if sameHeadAndSpine
           then do
-            traceFail PhDefEq TkUnfold TraceSummary "defeq.vdef.opaque.lhs" [("const", TrName n1)]
-            pure False
-          else do
-            v1' <- thunk1
-            isDefEqValue depth v1' v2
-      (_, VDef n2 _ _ thunk2) -> do
-        hint2 <- getDefHints n2
-        if hint2 == Opaque
-          then do
-            traceFail PhDefEq TkUnfold TraceSummary "defeq.vdef.opaque.rhs" [("const", TrName n2)]
-            pure False
-          else do
-            v2' <- thunk2
-            isDefEqValue depth v1 v2'
+            traceOk
+              PhDefEq
+              TkCompare
+              TraceSummary
+              "defeq.vdef.sameHeadSpine"
+              [ ("const", TrName n1),
+                ("spineLen", TrInt (length s1))
+              ]
+            pure True
+          else
+            unfoldVDefsByHint depth v1 v2
+      (VDef {}, _) -> unfoldVDefsByHint depth v1 v2
+      (_, VDef {}) -> unfoldVDefsByHint depth v1 v2
       (VLam n _ ty clo, other) -> checkEta depth n ty clo other
       (other, VLam n _ ty clo) -> checkEta depth n ty clo other
       (VNeutral (HConst c1 _) s1, other) -> do
@@ -713,28 +838,28 @@ inferValue depth val = traceBlock PhInfer TkEnter TraceSummary "infer.value" [("
       qenv <- reconstructEnv depth
       pure $ VPi name bi dom (Closure qenv bodyTyExpr)
   VNeutral head spine -> inferHeadApp depth head spine
-  VDef name lvls spine _ -> inferHeadApp depth (HConst name lvls) spine
+  VDef name lvls spine -> inferHeadApp depth (HConst name lvls) spine
 
-ensureSort :: Value -> KernelM HCLevel
-ensureSort val = traceBlock PhInfer TkDecision TraceSummary "ensure.sort" [("value", TrValueHead val)] $ do
-  forced <- force val
-  case forced of
+ensureSort :: Int -> Value -> KernelM HCLevel
+ensureSort depth val = traceBlock PhInfer TkDecision TraceSummary "ensure.sort" [("value", TrValueHead val)] $ do
+  whnfVal <- whnf depth val
+  case whnfVal of
     VSort lvl -> do
       traceOk PhInfer TkDecision TraceSummary "ensure.sort.ok" [("level", TrLevel lvl)]
       pure lvl
     _ -> do
-      traceFail PhInfer TkDecision TraceSummary "ensure.sort.fail" [("value", TrValueHead forced)]
+      traceFail PhInfer TkDecision TraceSummary "ensure.sort.fail" [("value", TrValueHead whnfVal)]
       throwError "Expected a Sort"
 
-ensurePi :: Value -> KernelM (HCName, BinderInfo, Value, Closure)
-ensurePi val = traceBlock PhInfer TkDecision TraceSummary "ensure.pi" [("value", TrValueHead val)] $ do
-  forced <- force val
-  case forced of
+ensurePi :: Int -> Value -> KernelM (HCName, BinderInfo, Value, Closure)
+ensurePi depth val = traceBlock PhInfer TkDecision TraceSummary "ensure.pi" [("value", TrValueHead val)] $ do
+  whnfVal <- whnf depth val
+  case whnfVal of
     VPi n bi ty clo -> do
       traceOk PhInfer TkDecision TraceSummary "ensure.pi.ok" [("binder", TrName n)]
       pure (n, bi, ty, clo)
     _ -> do
-      traceFail PhInfer TkDecision TraceSummary "ensure.pi.fail" [("value", TrValueHead forced)]
+      traceFail PhInfer TkDecision TraceSummary "ensure.pi.fail" [("value", TrValueHead whnfVal)]
       throwError "Expected a Pi (Forall) type"
 
 expandLiteralCtor :: Value -> KernelM Value
@@ -782,7 +907,7 @@ inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" 
   App fn arg -> do
     traceEvent PhInfer TkEvent TraceDetail "infer.app.fnType" []
     fnTypeVal <- inferExpr depth env fn
-    (_, _, domTypeVal, clo) <- ensurePi fnTypeVal
+    (_, _, domTypeVal, clo) <- ensurePi depth fnTypeVal
     traceEvent PhInfer TkEvent TraceDetail "infer.app.arg" []
     argVal <- evalM env arg
     argTypeVal <- inferValue depth argVal
@@ -800,7 +925,7 @@ inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" 
     traceEvent PhInfer TkEvent TraceDetail "infer.lam.domain" [("binder", TrName name)]
     -- Infer the type of the domain type, and ensure it's a sort
     domTypeSort <- inferExpr depth env dom
-    _ <- ensureSort domTypeSort
+    _ <- ensureSort depth domTypeSort
     -- Evaluate the domain type
     domTypeVal <- evalM env dom
     let decl = LocalDecl name domTypeVal Nothing
@@ -814,21 +939,21 @@ inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" 
   ForallE name dom body _ -> do
     traceEvent PhInfer TkEvent TraceDetail "infer.pi.domain" [("binder", TrName name)]
     domTypeSort <- inferExpr depth env dom
-    forcedDomTypeSort <- force domTypeSort
-    lvl1 <- ensureSort forcedDomTypeSort
+    whnfDomTypeSort <- whnf depth domTypeSort
+    lvl1 <- ensureSort depth whnfDomTypeSort
     domTypeVal <- evalM env dom
     let decl = LocalDecl name domTypeVal Nothing
     let levelVal = VNeutral (HLvl name depth) []
     traceEvent PhLocalCtx TkEnter TraceDetail "infer.pi.codomain" [("binder", TrName name), ("level", TrInt depth)]
     bodyTypeVal <- withLocalDecl depth decl $ inferExpr (depth + 1) (levelVal : env) body
-    lvl2 <- ensureSort bodyTypeVal
+    lvl2 <- ensureSort depth bodyTypeVal
     traceEvent PhInfer TkEvent TraceDetail "infer.pi.imax" [("domainLevel", TrLevel lvl1), ("codomainLevel", TrLevel lvl2)]
     imaxLvl <- mkLevelIMax lvl1 lvl2
     pure $ VSort imaxLvl
   Let name dom value body nondep -> do
     traceEvent PhInfer TkEvent TraceDetail "infer.let.type" [("name", TrName name)]
     domTypeSort <- inferExpr depth env dom
-    _ <- ensureSort domTypeSort
+    _ <- ensureSort depth domTypeSort
     domTypeVal <- evalM env dom
     valueVal <- evalM env value
     valueTypeVal <- inferValue depth valueVal
@@ -852,9 +977,9 @@ inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" 
       [("proj", TrName projName), ("field", TrInt fieldIdx)]
 
     structTyVal <- inferExpr depth env structExpr
-    forcedStructTy <- force structTyVal
+    whnfStructTy <- whnf depth structTyVal
 
-    case forcedStructTy of
+    case whnfStructTy of
       VNeutral (HConst indName indLvls) indSpine -> do
         structVal <- evalM env structExpr
         inferProjectionFieldTypeFromInductive
@@ -900,13 +1025,13 @@ inferProjectionFieldTypeFromInductive depth projName fieldIdx indName indLvls in
   ctorTypeVal <- evalM [] ctorTypeExpr
 
   paramVals <- inductiveParamValuesForward indVal indSpine
-  tyAfterParams <- foldM instantiatePi ctorTypeVal paramVals
+  tyAfterParams <- foldM (instantiatePi depth) ctorTypeVal paramVals
 
   let prevProjs = [0 .. fieldIdx - 1]
   prevProjVals <- mapM (applyElimM depth structVal . EProj projName) prevProjs
 
-  tyAfterProjs <- foldM instantiatePi tyAfterParams prevProjVals
-  (finalFieldTy, _) <- extractPiDomain tyAfterProjs
+  tyAfterProjs <- foldM (instantiatePi depth) tyAfterParams prevProjVals
+  (finalFieldTy, _) <- extractPiDomain depth tyAfterProjs
 
   pure finalFieldTy
 
@@ -940,7 +1065,7 @@ inferHeadApp depth head spine = do
 -- | Step through the type by applying eliminations
 applyTypeElimAndVal :: Int -> (Value, Value) -> Elim -> KernelM (Value, Value)
 applyTypeElimAndVal depth (currentType, currentVal) elim = do
-  typeWhnf <- force currentType
+  typeWhnf <- whnf depth currentType
   traceEvent PhInfer TkSpine TraceDetail "infer.typeElim" [("type", TrValueHead currentType), ("elim", TrElim elim)]
   traceEvent PhInfer TkSpine TraceDump "infer.typeElim.full" [("type", TrValue currentType), ("elim", TrElim elim)]
   case (typeWhnf, elim) of
@@ -970,17 +1095,17 @@ applyTypeElimAndVal depth (currentType, currentVal) elim = do
 
 --------------------------------------------------------------------------------
 
-instantiatePi :: Value -> Value -> KernelM Value
-instantiatePi piVal argVal = do
-  forced <- force piVal
-  case forced of
+instantiatePi :: Int -> Value -> Value -> KernelM Value
+instantiatePi depth piVal argVal = do
+  whnfVal <- whnf depth piVal
+  case whnfVal of
     VPi _ _ _ clo -> evalM (argVal : closureEnv clo) (closureBody clo)
     _ -> throwError "Expected Pi type in constructor"
 
-extractPiDomain :: Value -> KernelM (Value, Closure)
-extractPiDomain piVal = do
-  forced <- force piVal
-  case forced of
+extractPiDomain :: Int -> Value -> KernelM (Value, Closure)
+extractPiDomain depth piVal = do
+  whnfVal <- whnf depth piVal
+  case whnfVal of
     VPi _ _ dom clo -> pure (dom, clo)
     _ -> throwError "Expected Pi type to extract domain"
 
@@ -1174,7 +1299,7 @@ checkStructEta depth ctorName spine otherVal = traceBlock PhEta TkCompare TraceD
 -- | Converts a WHNF Value back into a fully normalized AST
 quote :: Int -> Value -> KernelM HCExpr
 quote depth val = traceBlock PhQuote TkEnter TraceSummary "quote.value" [("depth", TrInt depth), ("value", TrValueHead val)] $ do
-  v <- force val
+  v <- whnf depth val
   case v of
     VSort lvl -> mkSort lvl
     VLit lit -> mkLit lit
@@ -1200,7 +1325,7 @@ quote depth val = traceBlock PhQuote TkEnter TraceSummary "quote.value" [("depth
         HConst name levels -> mkConst name levels
       traceEvent PhQuote TkEvent TraceDetail "quote.neutral.head" [("head", TrHead head), ("spineLen", TrInt (length spine))]
       foldM (quoteElim depth) headExpr (reverse spine)
-    VDef _ _ _ _ -> throwError "Unreachable: VDef remaining after force"
+    VDef _ _ _ -> throwError "Unreachable: VDef remaining after whnf"
 
 quoteElim :: Int -> HCExpr -> Elim -> KernelM HCExpr
 quoteElim depth headExpr (EApp argVal) = do

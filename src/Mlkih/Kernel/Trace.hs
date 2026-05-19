@@ -96,7 +96,7 @@ traceValueHeadNames v =
     VLam n _ _ _ -> [n]
     VPi n _ _ _ -> [n]
     VNeutral h _ -> traceHeadNames h
-    VDef n _ _ _ -> [n]
+    VDef n _ _ -> [n]
 
 matchesConstants :: Maybe [HCName] -> TraceEvent -> Bool
 matchesConstants Nothing _ = True

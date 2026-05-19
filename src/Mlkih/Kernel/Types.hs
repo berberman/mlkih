@@ -195,7 +195,7 @@ data TraceKind
   | TkLookup
   | TkSpine
   | TkUnfold
-  | TkForce
+  | TkWHNF
   | TkError
   deriving (Eq, Ord, Show)
 
@@ -304,7 +304,7 @@ instance PrettyPrint TraceField where
             red (text "Neutral")
               <+> ppr h
               <+> dim (text "spineLen=" <> int (length sp))
-          VDef n lvls sp _ ->
+          VDef n lvls sp ->
             blue (text "Def")
               <+> ppr n
               <+> dim (brackets (hcatWithComma (map ppr lvls)))
@@ -346,7 +346,7 @@ instance PrettyPrint TraceKind where
       TkLookup -> text "lookup"
       TkSpine -> text "spine"
       TkUnfold -> text "unfold"
-      TkForce -> text "force"
+      TkWHNF -> text "whnf"
       TkError -> text "error"
 
 --------------------------------------------------------------------------------
@@ -384,17 +384,22 @@ instance Eq Head where
   HConst n1 ls1 == HConst n2 ls2 = n1 == n2 && ls1 == ls2
   _ == _ = False
 
+-- | INVARIANT:
+-- 1. @VDef name lvls spineRev@ is a delayed transparent global constant
+--    application. It may reduce when exposed by whnf.
+-- 2. All other Value constructors are considered head-exposed values.
+-- 3. @VNeutral head spineRev@ must only be produced after reduction has tried
+--    to make progress and determined that the head/spine is stuck, or for
+--    irreducible constants/locals with no pending reducible head.
 data Value
-  = VSort HCLevel
-  | VLit Literal
-  | VLam HCName BinderInfo Value Closure
-  | VPi HCName BinderInfo Value Closure
+  = VSort !HCLevel
+  | VLit !Literal
+  | VLam !HCName !BinderInfo !Value !Closure
+  | VPi !HCName !BinderInfo !Value !Closure
   | -- | A stuck term (e.g., Free Variable applied to arguments)
-    VNeutral Head Spine
+    VNeutral !Head !Spine
   | -- | Lazy Delta Reduction
-    -- We store the structural data for fast head-checks, and a lazy
-    -- Haskell thunk of the unfolded definition.
-    VDef HCName [HCLevel] Spine (KernelM Value)
+    VDef !HCName ![HCLevel] !Spine
   deriving (Show)
 
 instance PrettyPrint Closure where
@@ -434,4 +439,4 @@ instance PrettyPrint Value where
       VLam name binderInfo ty body -> magenta (text "VLam") <+> parens (ppBinder binderInfo name ty <+> text "=>" <+> ppr body)
       VPi name binderInfo ty body -> bold (magenta (text "VPi")) <+> parens (ppBinder binderInfo name ty <+> text "=>" <+> ppr body)
       VNeutral head spine -> red (text "VNeutral") <+> parens (ppr head <+> ppr spine)
-      VDef name levels spine _ -> blue (text "VDef") <+> parens (ppr name <+> ppr levels <+> ppr spine <+> (dim (text "<thunk>")))
+      VDef name levels spine -> blue (text "VDef") <+> parens (ppr name <+> ppr levels <+> ppr spine)
