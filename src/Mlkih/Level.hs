@@ -34,10 +34,10 @@ instance (Hashable l, Hashable n) => Hashable (Level' l n) where
 instance (PrettyPrint l, PrettyPrint n) => PrettyPrint (Level' l n) where
   ppr level =
     case level of
-      LZero -> char '0'
-      LSucc inner -> parens (ppr inner <+> char '+' <+> int 1)
-      LMax lhs rhs -> text "max" <> parens (ppr lhs <> text ", " <> ppr rhs)
-      LIMax lhs rhs -> text "imax" <> parens (ppr lhs <> text ", " <> ppr rhs)
+      LZero -> ppr '0'
+      LSucc inner -> parens (ppr inner <+> ppr '+' <+> ppr (1 :: Int))
+      LMax lhs rhs -> group (ppr "max" <> parens (hcatWithComma [ppr lhs, ppr rhs]))
+      LIMax lhs rhs -> group (ppr "imax" <> parens (hcatWithComma [ppr lhs, ppr rhs]))
       LVar name -> ppr name
 
 newtype Level = Level {unLevel :: Level' Level Name}

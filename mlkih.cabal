@@ -56,7 +56,7 @@ library
     , bytestring
     , containers
     , hashable
-    , pretty
+    , prettyprinter
     , scientific
     , text
     , unordered-containers

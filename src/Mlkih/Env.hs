@@ -28,9 +28,9 @@ data ReducibilityHints
 instance PrettyPrint ReducibilityHints where
   ppr hints =
     case hints of
-      Opaque -> text "opaque"
-      Abbrev -> text "abbrev"
-      Regular n -> text "regular" <+> int n
+      Opaque -> ppr "opaque"
+      Abbrev -> ppr "abbrev"
+      Regular n -> group (ppr "regular" <+> ppr n)
 
 -- | Smaller hints (larger heights) are unfolded first.
 instance Ord ReducibilityHints where
@@ -90,10 +90,10 @@ data QuotKind
 instance PrettyPrint QuotKind where
   ppr quotKind =
     case quotKind of
-      Quot -> text "type"
-      QuotMk -> text "ctor"
-      QuotLift -> text "lift"
-      QuotInd -> text "ind"
+      Quot -> ppr "type"
+      QuotMk -> ppr "ctor"
+      QuotLift -> ppr "lift"
+      QuotInd -> ppr "ind"
 
 data QuotVal e l = QuotVal
   { quotConst :: ConstantVal e l,
@@ -240,121 +240,71 @@ constantInfoIsDeltaUnfoldable = maybe False (const True) . constantInfoDeltaUnfo
 type KernelEnv = IntMap (ConstantInfo HCExpr HCLevel)
 
 --------------------------------------------------------------------------------
-
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (ConstantVal e l) where
   ppr constantVal =
-    text "constant"
-      <+> ppr (constName constantVal)
-      <+> ppLevelParams (constLevelParameters constantVal)
-      <+> char ':'
-      <+> ppr (constType constantVal)
+    ppConstSignature "constant" constantVal
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (DefinitionVal e l) where
   ppr defn =
-    ( text "def"
-        <+> ppr (constName (defConst defn))
-        <+> ppLevelParams (constLevelParameters (defConst defn))
-        <+> char ':'
-        <+> ppr (constType (defConst defn))
-        <+> text ":="
-        <+> ppr (defValue defn)
-    )
-      <+> (text "[" <> ppr (defHints defn) <> text "]")
+    ppConstBody
+      "def"
+      (defConst defn)
+      (defValue defn)
+      [ppAttr [ppFieldDoc "hint" (ppr (defHints defn))]]
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (TheoremVal e l) where
   ppr thm =
-    text "theorem"
-      <+> ppr (constName (thmConst thm))
-      <+> ppLevelParams (constLevelParameters (thmConst thm))
-      <+> char ':'
-      <+> ppr (constType (thmConst thm))
-      <+> text ":="
-      <+> ppr (thmValue thm)
+    ppConstBody "theorem" (thmConst thm) (thmValue thm) []
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (OpaqueVal e l) where
   ppr opaqueVal =
-    text "opaque"
-      <+> ppr (constName (opaqueConst opaqueVal))
-      <+> ppLevelParams (constLevelParameters (opaqueConst opaqueVal))
-      <+> char ':'
-      <+> ppr (constType (opaqueConst opaqueVal))
-      <+> text ":="
-      <+> ppr (opaqueValue opaqueVal)
+    ppConstBody "opaque" (opaqueConst opaqueVal) (opaqueValue opaqueVal) []
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (InductiveVal e l) where
   ppr indVal =
-    ( text "inductive"
-        <+> ppr (constName (indConst indVal))
-        <+> ppLevelParams (constLevelParameters (indConst indVal))
-        <+> char ':'
-        <+> ppr (constType (indConst indVal))
-    )
-      <+> ( text "[params="
-              <> int (indParamsN indVal)
-              <> text ", indices="
-              <> int (indIndicesN indVal)
-              <> text ", ctors="
-              <> ppr (indCtors indVal)
-              <> text "]"
-          )
+    ppConstSignature "inductive" (indConst indVal)
+      <+> ppAttr
+        [ ppFieldDoc "params" (ppr (indParamsN indVal)),
+          ppFieldDoc "indices" (ppr (indIndicesN indVal)),
+          ppFieldDoc "ctors" (ppr (indCtors indVal))
+        ]
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (QuotVal e l) where
   ppr quotVal =
-    ( text "quot"
-        <+> ppr (constName (quotConst quotVal))
-        <+> ppLevelParams (constLevelParameters (quotConst quotVal))
-        <+> char ':'
-        <+> ppr (constType (quotConst quotVal))
-    )
-      <+> (text "[kind=" <> ppr (quotKind quotVal) <> text "]")
+    ppConstSignature "quot" (quotConst quotVal)
+      <+> ppAttr [ppFieldDoc "kind" (ppr (quotKind quotVal))]
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (ConstructorVal e l) where
   ppr ctor =
-    ( text "ctor"
-        <+> ppr (constName (ctorConst ctor))
-        <+> ppLevelParams (constLevelParameters (ctorConst ctor))
-        <+> char ':'
-        <+> ppr (constType (ctorConst ctor))
-    )
-      <+> ( text "[inductive="
-              <> ppr (ctorInductive ctor)
-              <> text ", idx="
-              <> int (ctorIndex ctor)
-              <> text ", params="
-              <> int (ctorParamsN ctor)
-              <> text ", fields="
-              <> int (ctorFieldsN ctor)
-              <> text "]"
-          )
+    ppConstSignature "ctor" (ctorConst ctor)
+      <+> ppAttr
+        [ ppFieldDoc "inductive" (ppr (ctorInductive ctor)),
+          ppFieldDoc "idx" (ppr (ctorIndex ctor)),
+          ppFieldDoc "params" (ppr (ctorParamsN ctor)),
+          ppFieldDoc "fields" (ppr (ctorFieldsN ctor))
+        ]
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (RecursorRule e l) where
   ppr rule =
-    (text "rule" <+> ppr (recCtor rule))
-      <+> (text "[fields=" <> int (recFieldsN rule) <> text "] :=")
-      <+> ppr (recRhs rule)
+    group $
+      hang 2 $
+        sep
+          [ ppr "rule" <+> ppr (recCtor rule),
+            ppAttr [ppFieldDoc "fields" (ppr (recFieldsN rule))] <+> magenta (ppr ":="),
+            ppr (recRhs rule)
+          ]
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (RecursorVal e l) where
   ppr recVal =
-    ( text "recursor"
-        <+> ppr (constName (recConst recVal))
-        <+> ppLevelParams (constLevelParameters (recConst recVal))
-        <+> char ':'
-        <+> ppr (constType (recConst recVal))
-    )
-      <+> ( text "[params="
-              <> int (recParamsN recVal)
-              <> text ", indices="
-              <> int (recIndicesN recVal)
-              <> text ", motives="
-              <> int (recMotivesN recVal)
-              <> text ", minors="
-              <> int (recMinorsN recVal)
-              <> text ", k="
-              <> text (show (recKRule recVal))
-              <> text ", rules="
-              <> brackets (hcatWithComma (fmap ppr (recRules recVal)))
-              <> text "]"
-          )
+    ppConstSignature "recursor" (recConst recVal)
+      <+> ppAttr
+        [ ppFieldDoc "params" (ppr (recParamsN recVal)),
+          ppFieldDoc "indices" (ppr (recIndicesN recVal)),
+          ppFieldDoc "motives" (ppr (recMotivesN recVal)),
+          ppFieldDoc "minors" (ppr (recMinorsN recVal)),
+          ppFieldDoc "k" (ppr (show (recKRule recVal))),
+          ppFieldDoc "rules" (brackets (hcatWithComma (fmap ppr (recRules recVal))))
+        ]
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (ConstantInfo e l) where
   ppr constantInfo =
@@ -368,6 +318,46 @@ instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (ConstantInfo e l) where
       CtorInfo ctor -> ppr ctor
       RecInfo recVal -> ppr recVal
 
+ppConstSignature :: (PrettyPrint e, PrettyPrint l) => String -> ConstantVal e l -> Doc
+ppConstSignature keyword constantVal =
+  group $
+    hang 2 $
+      sep
+        [ ppConstHead keyword constantVal <+> dim (ppr ':'),
+          ppr (constType constantVal)
+        ]
+
+ppConstBody :: (PrettyPrint e, PrettyPrint l) => String -> ConstantVal e l -> Expr' e l HCName -> [Doc] -> Doc
+ppConstBody keyword constantVal rhs suffix =
+  group $
+    hang 2 $
+      sep $
+        [ ppConstHead keyword constantVal <+> dim (ppr ':'),
+          ppr (constType constantVal),
+          magenta (ppr ":="),
+          ppr rhs
+        ]
+          ++ suffix
+
+ppConstHead :: String -> ConstantVal e l -> Doc
+ppConstHead keyword constantVal =
+  ppr keyword
+    <+> ppNameWithLevels
+      (constName constantVal)
+      (constLevelParameters constantVal)
+
+ppNameWithLevels :: HCName -> [HCName] -> Doc
+ppNameWithLevels name [] = ppr name
+ppNameWithLevels name levelParams = ppr name <+> ppLevelParams levelParams
+
+ppAttr :: [Doc] -> Doc
+ppAttr fields =
+  group $ brackets (align (hcatWithComma fields))
+
+ppFieldDoc :: String -> Doc -> Doc
+ppFieldDoc key value =
+  group $ ppr key <> dim (ppr '=') <> align value
+
 ppLevelParams :: [HCName] -> Doc
-ppLevelParams [] = text ""
+ppLevelParams [] = mempty
 ppLevelParams levelParams = brackets (hcatWithComma (fmap ppr levelParams))

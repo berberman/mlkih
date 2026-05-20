@@ -29,14 +29,24 @@ data Decl e l
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (InductiveDecl e l) where
   ppr indDecl =
-    text "inductive-block"
-      <+> braces
-        ( (text "types =" <+> ppr (indTypes indDecl))
-            <> text ", ctors = "
-            <> ppr (indConstructors indDecl)
-            <> text ", recs = "
-            <> (ppr (indRecursors indDecl))
-        )
+    group $
+      ppr "inductive-block"
+        <+> align
+          ( braces $
+              sep $
+                punctuate
+                  (dim (ppr ','))
+                  [ ppField "types" (indTypes indDecl),
+                    ppField "ctors" (indConstructors indDecl),
+                    ppField "recs" (indRecursors indDecl)
+                  ]
+          )
+    where
+      ppField label value =
+        group $
+          ppr label
+            <+> dim (ppr '=')
+            <+> align (ppr value)
 
 instance (PrettyPrint e, PrettyPrint l) => PrettyPrint (Decl e l) where
   ppr decl =

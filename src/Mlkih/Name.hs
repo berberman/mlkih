@@ -22,15 +22,15 @@ instance (Hashable n) => Hashable (Name' n) where
 instance (HasName n, PrettyPrint n) => PrettyPrint (Name' n) where
   ppr name =
     case name of
-      Anonymous -> dim (char '_')
+      Anonymous -> dim (ppr '_')
       Str prefix segment ->
         case getName prefix of
-          Anonymous -> text (T.unpack segment)
-          _ -> ppr prefix <> dim (char '.') <> text (T.unpack segment)
+          Anonymous -> ppr (T.unpack segment)
+          _ -> ppr prefix <> dim (ppr '.') <> ppr (T.unpack segment)
       Num prefix n ->
         case getName prefix of
-          Anonymous -> cyan (int n)
-          _ -> ppr prefix <> dim (char '.') <> cyan (int n)
+          Anonymous -> cyan (ppr n)
+          _ -> ppr prefix <> dim (ppr '.') <> cyan (ppr n)
 
 nameToString :: (HasName a) => a -> String
 nameToString n = case getName n of

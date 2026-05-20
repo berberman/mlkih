@@ -20,7 +20,6 @@ import Mlkih.Level
 import Mlkih.Name
 import Mlkih.Pretty
 import Mlkih.Types
-import Text.PrettyPrint (nest, vcat)
 
 --------------------------------------------------------------------------------
 
@@ -218,136 +217,165 @@ data TraceOutcome
   deriving (Eq, Ord, Show)
 
 instance PrettyPrint TraceNode where
-  ppr (TraceLeaf ev) = ppTracePrefix False ev <+> ppTraceEventBody ev
+  ppr (TraceLeaf ev) =
+    group (ppTracePrefix False ev <+> ppTraceEventBody ev)
   ppr (TraceBlock ev children) =
-    vcat $ ppTraceBlockHeader : map (nest 2 . ppr) children
-    where
-      ppTraceBlockHeader = ppTracePrefix True ev <+> ppTraceEventBody ev
+    vsep $ group (ppTraceBlockHeader ev) : map (nest 2 . ppr) children
+
+ppTraceBlockHeader :: TraceEvent -> Doc
+ppTraceBlockHeader ev = ppTracePrefix True ev <+> ppTraceEventBody ev
 
 ppTracePrefix :: Bool -> TraceEvent -> Doc
 ppTracePrefix isBlock ev =
   case traceOutcome ev of
     Just OutOk ->
-      green (text (if isBlock then "▼" else "✓"))
+      green (ppr (if isBlock then "▼" else "✓"))
     Just OutFail ->
-      bold (red (text (if isBlock then "▼" else "✗")))
+      bold (red (ppr (if isBlock then "▼" else "✗")))
     Just OutStuck ->
-      yellow (text (if isBlock then "▼" else "⊣"))
+      yellow (ppr (if isBlock then "▼" else "⊣"))
     Just OutProgress ->
-      cyan (text (if isBlock then "▼" else "↦"))
+      cyan (ppr (if isBlock then "▼" else "↦"))
     Just OutNoProgress ->
-      dim (text (if isBlock then "▼" else "·"))
+      dim (ppr (if isBlock then "▼" else "·"))
     Nothing ->
       if isBlock
-        then bold (blue (text "▼"))
-        else green (text "⊢")
+        then bold (blue (ppr "▼"))
+        else green (ppr "⊢")
 
 ppTraceEventBody :: TraceEvent -> Doc
 ppTraceEventBody ev =
-  ppTraceMeta ev
-    <+> text (traceLabel ev)
-    <+> ppTraceFields (traceFields ev)
-  where
-    ppTraceFields [] = text ""
-    ppTraceFields fields =
-      dim (char '{')
-        <> hcatWithComma (map ppr fields)
-        <> dim (char '}')
-    ppTraceMeta ev =
-      dim $
-        brackets $
-          ppr (tracePhase ev)
-            <> char '/'
-            <> ppr (traceKind ev)
-            <> char '/'
-            <> ppr (traceEventVerbosity ev)
-            <> ppOutcomeSuffix (traceOutcome ev)
-    ppOutcomeSuffix Nothing = text ""
-    ppOutcomeSuffix (Just out) =
-      char '/'
-        <> case out of
-          OutOk -> text "ok"
-          OutFail -> text "fail"
-          OutStuck -> text "stuck"
-          OutProgress -> text "progress"
-          OutNoProgress -> text "no-progress"
+  group $
+    align $
+      sep $
+        [ ppTraceMeta ev,
+          ppr (traceLabel ev)
+        ]
+          ++ ppTraceFields (traceFields ev)
+
+ppTraceFields :: [TraceField] -> [Doc]
+ppTraceFields [] = []
+ppTraceFields fields = [ppTraceFieldList fields]
+
+ppTraceMeta :: TraceEvent -> Doc
+ppTraceMeta event =
+  dim $
+    brackets $
+      ppr (tracePhase event)
+        <> ppr '/'
+        <> ppr (traceKind event)
+        <> ppr '/'
+        <> ppr (traceEventVerbosity event)
+        <> ppOutcomeSuffix (traceOutcome event)
+
+ppOutcomeSuffix :: Maybe TraceOutcome -> Doc
+ppOutcomeSuffix Nothing = mempty
+ppOutcomeSuffix (Just out) =
+  ppr '/'
+    <> case out of
+      OutOk -> ppr "ok"
+      OutFail -> ppr "fail"
+      OutStuck -> ppr "stuck"
+      OutProgress -> ppr "progress"
+      OutNoProgress -> ppr "no-progress"
+
+ppTraceFieldList :: [TraceField] -> Doc
+ppTraceFieldList fields =
+  group $
+    dim (ppr '{')
+      <> align (hcatWithComma (map ppr fields))
+      <> dim (ppr '}')
 
 instance PrettyPrint TraceField where
-  ppr (key, val) = cyan (text key) <> dim (char '=') <> ppTraceFieldValue val
+  ppr (key, val) =
+    group $
+      cyan (ppr key)
+        <> dim (ppr '=')
+        <> align (ppTraceFieldValue val)
     where
-      ppTraceFieldValue val =
-        case val of
-          TrString s -> text s
-          TrDoc d -> d
-          TrInt n -> int n
-          TrBool b -> text (show b)
+      ppTraceFieldValue fieldVal =
+        case fieldVal of
+          TrString str -> ppr str
+          TrDoc doc -> doc
+          TrInt n -> ppr n
+          TrBool b -> ppr (show b)
           TrName n -> ppr n
-          TrLevel l -> ppr l
-          TrExpr e -> ppr e
-          TrValue v -> ppr v
-          TrValueHead v -> ppValueHead v
+          TrLevel lvl -> ppr lvl
+          TrExpr expr -> ppr expr
+          TrValue value -> ppr value
+          TrValueHead value -> ppValueHead value
           TrHead h -> ppr h
-          TrElim e -> ppr e
+          TrElim elim -> ppr elim
           TrSpine sp -> brackets (hcatWithComma (map ppr sp))
-          TrSpineLen sp -> int (length sp)
-      ppValueHead v =
-        case v of
+          TrSpineLen sp -> ppr (length sp)
+      ppValueHead value =
+        case value of
           VSort lvl ->
-            yellow (text "Sort") <+> ppr lvl
+            yellow (ppr "Sort") <+> ppr lvl
           VLit lit ->
-            cyan (text "Lit") <+> ppr lit
+            cyan (ppr "Lit") <+> ppr lit
           VLam n _ _ _ ->
-            magenta (text "Lam") <+> ppr n
+            magenta (ppr "Lam") <+> ppr n
           VPi n _ _ _ ->
-            magenta (text "Pi") <+> ppr n
+            magenta (ppr "Pi") <+> ppr n
           VNeutral h sp ->
-            red (text "Neutral")
-              <+> ppr h
-              <+> dim (text "spineLen=" <> int (length sp))
+            group $
+              red (ppr "Neutral")
+                <+> align
+                  ( sep
+                      [ ppr h,
+                        dim (ppr "spineLen=" <> ppr (length sp))
+                      ]
+                  )
           VDef n lvls sp ->
-            blue (text "Def")
-              <+> ppr n
-              <+> dim (brackets (hcatWithComma (map ppr lvls)))
-              <+> dim (text "spineLen=" <> int (length sp))
+            group $
+              blue (ppr "Def")
+                <+> align
+                  ( sep
+                      [ ppr n,
+                        dim (brackets (hcatWithComma (map ppr lvls))),
+                        dim (ppr "spineLen=" <> ppr (length sp))
+                      ]
+                  )
 
 instance PrettyPrint TraceVerbosity where
   ppr v = case v of
-    TraceOff -> text "off"
-    TraceSummary -> text "summary"
-    TraceDetail -> text "detail"
-    TraceDump -> text "dump"
+    TraceOff -> ppr "off"
+    TraceSummary -> ppr "summary"
+    TraceDetail -> ppr "detail"
+    TraceDump -> ppr "dump"
 
 instance PrettyPrint TracePhase where
   ppr p =
     case p of
-      PhDecl -> text "decl"
-      PhInfer -> text "infer"
-      PhEval -> text "eval"
-      PhDefEq -> text "defeq"
-      PhReduce -> text "reduce"
-      PhQuote -> text "quote"
-      PhEta -> text "eta"
-      PhLookup -> text "lookup"
-      PhLocalCtx -> text "local"
-      PhMisc -> text "misc"
+      PhDecl -> ppr "decl"
+      PhInfer -> ppr "infer"
+      PhEval -> ppr "eval"
+      PhDefEq -> ppr "defeq"
+      PhReduce -> ppr "reduce"
+      PhQuote -> ppr "quote"
+      PhEta -> ppr "eta"
+      PhLookup -> ppr "lookup"
+      PhLocalCtx -> ppr "local"
+      PhMisc -> ppr "misc"
 
 instance PrettyPrint TraceKind where
   ppr k =
     case k of
-      TkEnter -> text "enter"
-      TkEvent -> text "event"
-      TkDecision -> text "decision"
-      TkSuccess -> text "success"
-      TkFailure -> text "failure"
-      TkStuck -> text "stuck"
-      TkFallback -> text "fallback"
-      TkReduction -> text "reduction"
-      TkCompare -> text "compare"
-      TkLookup -> text "lookup"
-      TkSpine -> text "spine"
-      TkUnfold -> text "unfold"
-      TkWHNF -> text "whnf"
-      TkError -> text "error"
+      TkEnter -> ppr "enter"
+      TkEvent -> ppr "event"
+      TkDecision -> ppr "decision"
+      TkSuccess -> ppr "success"
+      TkFailure -> ppr "failure"
+      TkStuck -> ppr "stuck"
+      TkFallback -> ppr "fallback"
+      TkReduction -> ppr "reduction"
+      TkCompare -> ppr "compare"
+      TkLookup -> ppr "lookup"
+      TkSpine -> ppr "spine"
+      TkUnfold -> ppr "unfold"
+      TkWHNF -> ppr "whnf"
+      TkError -> ppr "error"
 
 --------------------------------------------------------------------------------
 
@@ -404,39 +432,71 @@ data Value
 
 instance PrettyPrint Closure where
   ppr (Closure env body) =
-    dim (text "Closure")
-      <> ( dim (char '{')
-             <+> dim (text "env:")
-             <+> brackets (hcatWithComma (map ppr env))
-             <+> dim (text "body:")
-             <+> ppr body
-             <+> dim (char '}')
-         )
+    group $
+      dim (ppr "Closure")
+        <+> dim
+          ( braces $
+              align $
+                sep
+                  [ ppr "env:" <+> brackets (hcatWithComma (map ppr env)),
+                    ppr "body:" <+> ppr body
+                  ]
+          )
 
 instance PrettyPrint Elim where
   ppr elim =
     case elim of
       EApp arg ->
-        bold (magenta (text "EApp")) <+> dim (parens (ppr arg))
+        group $ bold (magenta (ppr "EApp")) <+> dim (parens (align (ppr arg)))
       EProj projName idx ->
-        bold (magenta (text "EProj")) <+> dim (parens (green (ppr projName) <> dim (char '.') <> cyan (int idx)))
+        group $
+          bold (magenta (ppr "EProj"))
+            <+> dim
+              ( parens $
+                  green (ppr projName) <> dim (ppr '.') <> cyan (ppr idx)
+              )
 
 instance PrettyPrint Head where
   ppr head =
     case head of
-      HLvl name lvl -> cyan $ ppr name <> text "^" <> int lvl
+      HLvl name lvl -> cyan $ ppr name <> ppr "^" <> ppr lvl
       HConst name levels ->
         green (ppr name)
           <> if null levels
-            then text ""
+            then mempty
             else dim (brackets (hcatWithComma (map ppr levels)))
 
 instance PrettyPrint Value where
   ppr val =
     case val of
-      VSort lvl -> yellow (text "VSort") <+> parens (ppr lvl)
-      VLit lit -> cyan (text "VLit") <+> parens (ppr lit)
-      VLam name binderInfo ty body -> magenta (text "VLam") <+> parens (ppBinder binderInfo name ty <+> text "=>" <+> ppr body)
-      VPi name binderInfo ty body -> bold (magenta (text "VPi")) <+> parens (ppBinder binderInfo name ty <+> text "=>" <+> ppr body)
-      VNeutral head spine -> red (text "VNeutral") <+> parens (ppr head <+> ppr spine)
-      VDef name levels spine -> blue (text "VDef") <+> parens (ppr name <+> ppr levels <+> ppr spine)
+      VSort lvl ->
+        yellow (ppr "VSort") <+> parens (ppr lvl)
+      VLit lit ->
+        cyan (ppr "VLit") <+> parens (ppr lit)
+      VLam name binderInfo ty body ->
+        ppValueBinder (magenta (ppr "VLam")) name binderInfo ty body
+      VPi name binderInfo ty body ->
+        ppValueBinder (bold (magenta (ppr "VPi"))) name binderInfo ty body
+      VNeutral head spine ->
+        ppValueApp (red (ppr "VNeutral")) [ppr head, ppr spine]
+      VDef name levels spine ->
+        ppValueApp (blue (ppr "VDef")) [ppr name, ppr levels, ppr spine]
+
+ppValueBinder :: Doc -> HCName -> BinderInfo -> Value -> Closure -> Doc
+ppValueBinder keyword name binderInfo ty body =
+  group $
+    keyword
+      <+> parens
+        ( align $
+            sep
+              [ ppBinder binderInfo name ty,
+                magenta (ppr "=>"),
+                ppr body
+              ]
+        )
+
+ppValueApp :: Doc -> [Doc] -> Doc
+ppValueApp keyword args =
+  group $
+    keyword
+      <+> parens (align (sep args))

@@ -34,7 +34,6 @@ import Control.Monad.State.Strict
 import Mlkih.Kernel.Types
 import Mlkih.Name
 import Mlkih.Pretty
-import Text.PrettyPrint (vcat)
 
 defaultTraceConfig :: TraceConfig
 defaultTraceConfig =
@@ -265,14 +264,12 @@ traceBlock phase kind verb label fields action = do
 renderKernelTrace :: KernelState -> Doc
 renderKernelTrace st =
   case checkTraceStack st of
-    [] ->
-      text "No trace generated."
-    [topLevel] ->
-      vcat (map ppr topLevel)
+    [] -> ppr "No trace generated."
+    [topLevel] -> vsep (map ppr topLevel)
     malformedStack ->
-      text "Warning: Malformed trace stack."
-        <> text "\n"
-        <> vcat (map ppr (concat (reverse malformedStack)))
+      ppr "Warning: Malformed trace stack."
+        <> line
+        <> vsep (map ppr (concat (reverse malformedStack)))
 
 withTraceConfig :: TraceConfig -> KernelM a -> KernelM a
 withTraceConfig cfg =
