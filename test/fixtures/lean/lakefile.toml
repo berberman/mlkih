@@ -14,3 +14,6 @@ name = "NatAddAddAddCommFixture"
 
 [[lean_lib]]
 name = "TutorialFixture"
+
+[[lean_lib]]
+name = "FooFixture"

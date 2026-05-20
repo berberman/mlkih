@@ -24,6 +24,7 @@ module Mlkih.Kernel.Trace
     traceBlock,
     defaultTraceConfig,
     maxTraceConfig,
+    renderKernelTrace,
   )
 where
 

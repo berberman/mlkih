@@ -38,18 +38,20 @@ import Test.Tasty.HUnit
 main :: IO ()
 main = do
   -- defaultMain tests
+  -- parsed <- expectRight =<< parseExportFileWithState "export.exported.ndjson"
+  -- putStrLn "Parsed export file successfully, checking..."
+  parsed <- loadParsedLeanFixture fooFixture
+  state <- expectRightKernel $ withTraceVerbosity TraceDump $ withFullTrace $ checkParsedExport parsed
 
-  parsed <- loadParsedLeanFixture tutorialFixture
-  state <- expectRightKernel $ withTraceVerbosity TraceSummary  $ checkParsedExport parsed
-  printKernelTrace state
-  -- result <- parseExportFileWithState "export.exported.ndjson"
-  -- case result of
-  -- Left err -> failWith err
-  -- Right parsed -> pure ()
   pure ()
 
 expectRightKernel :: KernelM a -> IO KernelState
-expectRightKernel k = expectRight $ execKernelM' k
+expectRightKernel k = case runKernelM emptyKernelEnv emptyInternState k of
+  (Left err, state) -> do
+    writeFile "kernel_err_env.trace" (renderPlain $ ppr $ IntMap.elems $ checkEnv state)
+    writeFile "kernel_err_trace.trace" (renderPlain $ renderKernelTrace state)
+    failWith err
+  (Right _, state) -> pure state
 
 testDefEqCacheHits :: IO ()
 testDefEqCacheHits = do
@@ -471,6 +473,9 @@ data LeanFixture = LeanFixture
   { fixtureModuleName :: String,
     fixtureDeclNames :: [String]
   }
+
+fooFixture :: LeanFixture
+fooFixture = LeanFixture {fixtureModuleName = "FooFixture", fixtureDeclNames = ["foo"]}
 
 natAddSuccFixture :: LeanFixture
 natAddSuccFixture =

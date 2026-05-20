@@ -9,6 +9,7 @@ import Control.Monad.Except
 import Control.Monad.Reader (asks)
 import Control.Monad.Trans (lift)
 import qualified Data.IntMap.Strict as IntMap
+import Data.List ((!?))
 import Mlkih.AST
 import Mlkih.Env
 import Mlkih.Expr
@@ -31,7 +32,11 @@ evalM env expr = traceBlock PhEval TkEnter TraceDetail "eval.expr" [("expr", TrE
   case hceVal expr of
     BVar idx -> do
       traceEvent PhEval TkLookup TraceDetail "eval.bvar" [("index", TrInt idx)]
-      pure $ env !! idx
+      case env !? idx of
+        Just val -> pure val
+        _ -> do
+          traceFail PhEval TkLookup TraceSummary "eval.bvar.outOfBounds" [("index", TrInt idx), ("envLen", TrInt (length env))]
+          throwError $ "Local variable index out of bounds: " <> show idx
     Sort lvl -> do
       traceOk PhEval TkEvent TraceDetail "eval.sort" [("level", TrLevel lvl)]
       pure $ VSort lvl
@@ -508,8 +513,33 @@ unfoldVDefOne depth name levels spineRev =
         Just (DefnInfo def) -> do
           let subst = zip (constLevelParameters (defConst def)) levels
           bodyExpr <- instantiateLevelParamsExpr subst (defValue def)
+          traceEvent
+            PhDefEq
+            TkUnfold
+            TraceDump
+            "defeq.vdef.unfold.bodyExpr"
+            [("body", TrExpr bodyExpr)]
           bodyVal <- evalM [] bodyExpr
-          applyElimsM depth bodyVal spineRev
+          traceEvent
+            PhDefEq
+            TkUnfold
+            TraceDetail
+            "defeq.vdef.unfold.bodyVal"
+            [("body", TrValueHead bodyVal)]
+          result <- applyElimsM depth bodyVal spineRev
+          traceEvent
+            PhDefEq
+            TkUnfold
+            TraceDetail
+            "defeq.vdef.unfold.result"
+            [("result", TrValueHead result)]
+          traceEvent
+            PhDefEq
+            TkUnfold
+            TraceDump
+            "defeq.vdef.unfold.result.full"
+            [("result", TrValue result)]
+          pure result
         _ ->
           throwError $ "unfoldVDefOne: VDef head is not a transparent definition: " <> toString name
 
@@ -665,10 +695,28 @@ isPropType depth ty = do
   whnfTySort <- whnf depth tySort
   zero <- mkLevelZero
   case whnfTySort of
-    VSort lvl ->
-      pure (lvl == zero || levelEquiv lvl zero)
-    _ ->
-      pure False
+    VSort lvl -> pure (lvl == zero || levelEquiv lvl zero)
+    _ -> pure False
+
+-- | Compare two values at a known expected type.
+isDefEqValueAt :: Int -> Value -> Value -> Value -> KernelM Bool
+isDefEqValueAt depth expectedTy v1 v2 = do
+  same <- isDefEqValue depth v1 v2
+  if same
+    then pure True
+    else do
+      isProp <- isPropType depth expectedTy
+      if isProp
+        then do
+          traceOk
+            PhDefEq
+            TkCompare
+            TraceSummary
+            "defeq.proofIrrelevance"
+            [("expectedType", TrValueHead expectedTy)]
+          pure True
+        else
+          pure False
 
 --------------------------------------------------------------------------------
 
@@ -691,28 +739,18 @@ isDefEqValue depth val1 val2 = traceBlock PhDefEq TkCompare TraceSummary "defeq.
     _ -> do
       val1 <- expandLiteralCtor val1
       val2 <- expandLiteralCtor val2
-      valType <- inferValue depth val1
-      typeOfValType <- inferValue depth valType
-      let isProp = case typeOfValType of
-            VSort lvl -> getLevel lvl == LZero
-            _ -> False
-      if isProp
-        then do
-          traceOk PhDefEq TkCompare TraceSummary "defeq.proofIrrelevance" [("type", TrValueHead valType)]
-          pure True
-        else do
-          z1 <- tryZeta val1
-          case z1 of
-            Just u1 -> do
-              traceProgress PhDefEq TkReduction TraceDetail "zeta.lhs" [("level", TrValueHead val1)]
-              isDefEqValue depth u1 val2
-            Nothing -> do
-              z2 <- tryZeta val2
-              case z2 of
-                Just u2 -> do
-                  traceProgress PhDefEq TkReduction TraceDetail "zeta.rhs" [("level", TrValueHead val2)]
-                  isDefEqValue depth val1 u2
-                Nothing -> matchCore val1 val2
+      z1 <- tryZeta val1
+      case z1 of
+        Just u1 -> do
+          traceProgress PhDefEq TkReduction TraceDetail "zeta.lhs" [("level", TrValueHead val1)]
+          isDefEqValue depth u1 val2
+        Nothing -> do
+          z2 <- tryZeta val2
+          case z2 of
+            Just u2 -> do
+              traceProgress PhDefEq TkReduction TraceDetail "zeta.rhs" [("level", TrValueHead val2)]
+              isDefEqValue depth val1 u2
+            Nothing -> matchCore val1 val2
   where
     tryZeta :: Value -> KernelM (Maybe Value)
     tryZeta (VNeutral (HLvl _ lvl) s) = do
@@ -737,7 +775,39 @@ isDefEqValue depth val1 val2 = traceBlock PhDefEq TkCompare TraceSummary "defeq.
             withLocalDecl depth decl $ do
               body1 <- evalM (levelVal : closureEnv clo1) (closureBody clo1)
               body2 <- evalM (levelVal : closureEnv clo2) (closureBody clo2)
-              isDefEqValue (depth + 1) body1 body2
+              traceEvent
+                PhDefEq
+                TkCompare
+                TraceDetail
+                "defeq.lam.body"
+                [ ("binder", TrName n1),
+                  ("nextDepth", TrInt (depth + 1)),
+                  ("lhsBody", TrValueHead body1),
+                  ("rhsBody", TrValueHead body2)
+                ]
+              bodyEq <- isDefEqValue (depth + 1) body1 body2
+              if bodyEq
+                then pure True
+                else do
+                  traceFail
+                    PhDefEq
+                    TkCompare
+                    TraceSummary
+                    "defeq.lam.bodyMismatch"
+                    [ ("binder", TrName n1),
+                      ("nextDepth", TrInt (depth + 1)),
+                      ("lhsBody", TrValueHead body1),
+                      ("rhsBody", TrValueHead body2)
+                    ]
+                  traceEvent
+                    PhDefEq
+                    TkCompare
+                    TraceDump
+                    "defeq.lam.bodyMismatch.full"
+                    [ ("lhsBody", TrValue body1),
+                      ("rhsBody", TrValue body2)
+                    ]
+                  pure False
       (VPi n1 _ ty1 clo1, VPi _ _ ty2 clo2) -> do
         traceEvent PhDefEq TkCompare TraceDetail "defeq.pi.domains" [("binder", TrName n1)]
         typesEq <- isDefEqValue depth ty1 ty2
@@ -751,15 +821,55 @@ isDefEqValue depth val1 val2 = traceBlock PhDefEq TkCompare TraceSummary "defeq.
             withLocalDecl depth decl $ do
               body1 <- evalM (levelVal : closureEnv clo1) (closureBody clo1)
               body2 <- evalM (levelVal : closureEnv clo2) (closureBody clo2)
-              isDefEqValue (depth + 1) body1 body2
+              traceEvent
+                PhDefEq
+                TkCompare
+                TraceDetail
+                "defeq.pi.body"
+                [ ("binder", TrName n1),
+                  ("nextDepth", TrInt (depth + 1)),
+                  ("lhsBody", TrValueHead body1),
+                  ("rhsBody", TrValueHead body2)
+                ]
+              bodyEq <- isDefEqValue (depth + 1) body1 body2
+              if bodyEq
+                then pure True
+                else do
+                  traceFail
+                    PhDefEq
+                    TkCompare
+                    TraceSummary
+                    "defeq.pi.bodyMismatch"
+                    [ ("binder", TrName n1),
+                      ("nextDepth", TrInt (depth + 1)),
+                      ("lhsBody", TrValueHead body1),
+                      ("rhsBody", TrValueHead body2)
+                    ]
+                  traceEvent
+                    PhDefEq
+                    TkCompare
+                    TraceDump
+                    "defeq.pi.bodyMismatch.full"
+                    [ ("lhsBody", TrValue body1),
+                      ("rhsBody", TrValue body2)
+                    ]
+                  pure False
       (VNeutral h1 s1, VNeutral h2 s2)
-        | h1 == h2 -> do
-            traceEvent PhDefEq TkSpine TraceDetail "defeq.neutral.sameHead" [("head", TrHead h1), ("lhsLen", TrInt (length s1)), ("rhsLen", TrInt (length s2))]
-            isDefEqSpine depth s1 s2
+        | isDefEqHead h1 h2 -> do
+            traceEvent
+              PhDefEq
+              TkSpine
+              TraceDetail
+              "defeq.neutral.sameHead"
+              [ ("head", TrHead h1),
+                ("lhsLen", TrInt (length s1)),
+                ("rhsLen", TrInt (length s2))
+              ]
+            isDefEqHeadSpine depth h1 s1 s2
       (VDef n1 lvls1 s1, VDef n2 lvls2 s2) -> do
         sameHeadAndSpine <-
           if n1 == n2 && levelsEquiv lvls1 lvls2
-            then isDefEqSpine depth s1 s2 `catchError` \_ -> pure False
+            then isDefEqHeadSpine depth (HConst n1 lvls1) s1 s2 `catchError` \_ -> pure False
             else pure False
         if sameHeadAndSpine
           then do
@@ -912,11 +1022,31 @@ inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" 
     argVal <- evalM env arg
     argTypeVal <- inferValue depth argVal
     traceEvent PhDefEq TkCompare TraceDetail "infer.app.checkArg" [("argType", TrValueHead argTypeVal), ("domain", TrValueHead domTypeVal)]
-    isArgTypeOk <- isDefEqValue depth argTypeVal domTypeVal
+    isArgTypeOk <- traceBlock
+      PhInfer
+      TkCompare
+      TraceSummary
+      "infer.app.argDefEq"
+      [ ("depth", TrInt depth),
+        ("argType", TrValueHead argTypeVal),
+        ("domain", TrValueHead domTypeVal)
+      ]
+      $ do
+        traceEvent
+          PhInfer
+          TkCompare
+          TraceDump
+          "infer.app.argDefEq.full"
+          [ ("argType", TrValue argTypeVal),
+            ("domain", TrValue domTypeVal)
+          ]
+        isDefEqValue depth argTypeVal domTypeVal
     if not isArgTypeOk
       then do
         traceFail PhInfer TkFailure TraceSummary "infer.app.argMismatch" [("argType", TrValueHead argTypeVal), ("domain", TrValueHead domTypeVal)]
         traceEvent PhInfer TkEvent TraceDump "infer.app.argMismatch.full" [("argType", TrValue argTypeVal), ("domain", TrValue domTypeVal)]
+        debugQuoteValue depth "infer.app.argMismatch.argType.normalized" argTypeVal
+        debugQuoteValue depth "infer.app.argMismatch.domain.normalized" domTypeVal
         throwError "Argument type mismatch"
       else do
         traceOk PhInfer TkDecision TraceSummary "infer.app.ok" [("domain", TrValueHead domTypeVal)]
@@ -1035,32 +1165,163 @@ inferProjectionFieldTypeFromInductive depth projName fieldIdx indName indLvls in
 
   pure finalFieldTy
 
--- | Infer the type of a Head, then apply the spine
-inferHeadApp :: Int -> Head -> Spine -> KernelM Value
-inferHeadApp depth head spine = do
-  traceBlock PhInfer TkEnter TraceSummary "infer.headApp" [("depth", TrInt depth), ("head", TrHead head), ("spineLen", TrInt (length spine))] $ do
-    -- Get the base type of the Head
-    baseType <- case head of
+-- | Infer the type of a Head
+inferHeadType :: Int -> Head -> KernelM Value
+inferHeadType depth head =
+  traceBlock
+    PhInfer
+    TkEnter
+    TraceDetail
+    "infer.head.type"
+    [ ("depth", TrInt depth),
+      ("head", TrHead head)
+    ]
+    $ case head of
       HLvl _ lvl -> do
         ty <- lookupLocalType lvl
-        traceOk PhLookup TkLookup TraceDetail "infer.headApp.local" [("level", TrInt lvl)]
+        traceOk
+          PhLookup
+          TkLookup
+          TraceDetail
+          "infer.head.type.local"
+          [("level", TrInt lvl)]
         pure ty
       HConst name lvls -> do
         mInfo <- lookupConstInfo name
         case mInfo of
           Just info -> do
-            -- Instantiate the levels in the constant's type, and evaluate it
-            let subst = zip (constLevelParameters (constantInfoConst info)) lvls
-            instTypeExpr <- instantiateLevelParamsExpr subst (constType (constantInfoConst info))
+            let c = constantInfoConst info
+                subst = zip (constLevelParameters c) lvls
+            instTypeExpr <- instantiateLevelParamsExpr subst (constType c)
             tyVal <- evalM [] instTypeExpr
-            traceOk PhLookup TkLookup TraceDetail "infer.headApp.const" [("const", TrName name), ("levels", TrDoc (ppr lvls))]
+            traceOk
+              PhLookup
+              TkLookup
+              TraceDetail
+              "infer.head.type.const"
+              [ ("const", TrName name),
+                ("levels", TrDoc (ppr lvls))
+              ]
             pure tyVal
-          Nothing -> throwError "Unknown constant"
+          Nothing ->
+            throwError "inferHeadType: unknown constant"
+
+-- | Infer the final type of a head applied to a stored reversed spine.
+inferHeadApp :: Int -> Head -> Spine -> KernelM Value
+inferHeadApp depth head spine = do
+  traceBlock PhInfer TkEnter TraceSummary "infer.headApp" [("depth", TrInt depth), ("head", TrHead head), ("spineLen", TrInt (length spine))] $ do
+    -- Get the base type of the Head
+    baseType <- inferHeadType depth head
     let baseVal = VNeutral head []
     -- Fold over the spine in reverse order (since innermost arg is last in the list)
     (finalType, _) <- foldM (applyTypeElimAndVal depth) (baseType, baseVal) (reverse spine)
     traceOk PhInfer TkSpine TraceSummary "infer.headApp.spine.ok" [("spineLen", TrInt (length spine))]
     pure finalType
+
+isDefEqHead :: Head -> Head -> Bool
+isDefEqHead h1 h2 =
+  case (h1, h2) of
+    (HLvl _ lvl1, HLvl _ lvl2) ->
+      lvl1 == lvl2
+    (HConst n1 lvls1, HConst n2 lvls2) ->
+      n1 == n2 && levelsEquiv lvls1 lvls2
+    _ -> False
+
+-- | Compare two stored reversed spines under the same neutral head.
+-- This walks the head type while comparing arguments,
+-- so application arguments can be compared at their expected domain type.
+isDefEqHeadSpine :: Int -> Head -> Spine -> Spine -> KernelM Bool
+isDefEqHeadSpine depth head s1 s2 =
+  traceBlock
+    PhDefEq
+    TkSpine
+    TraceDetail
+    "defeq.spine.typed"
+    [ ("depth", TrInt depth),
+      ("lhsLen", TrInt (length s1)),
+      ("rhsLen", TrInt (length s2))
+    ]
+    $ do
+      if length s1 /= length s2
+        then pure False
+        else do
+          headTy <- inferHeadType depth head
+          let headVal = VNeutral head []
+          isDefEqSpineAt depth headTy headVal (reverse s1) (reverse s2)
+
+-- | Pairwise typed comparison of two forward-order elimination lists.
+-- For each application, this compares arguments at the current Pi domain, then advances
+-- the type and value. For projections, it advances using projection typing.
+isDefEqSpineAt :: Int -> Value -> Value -> [Elim] -> [Elim] -> KernelM Bool
+isDefEqSpineAt depth currentTy currentVal lhs rhs =
+  -- here lhs and rhs are in forward order
+  case (lhs, rhs) of
+    ([], []) -> pure True
+    (EApp a1 : xs, EApp a2 : ys) -> do
+      traceEvent
+        PhDefEq
+        TkSpine
+        TraceDetail
+        "defeq.spine.app"
+        [ ("depth", TrInt depth),
+          ("currentTy", TrValueHead currentTy),
+          ("lhsArg", TrValueHead a1),
+          ("rhsArg", TrValueHead a2)
+        ]
+      tyWhnf <- whnf depth currentTy
+      case tyWhnf of
+        VPi _ _ dom clo -> do
+          traceEvent
+            PhDefEq
+            TkSpine
+            TraceDetail
+            "defeq.spine.app.domain"
+            [("domain", TrValueHead dom)]
+          argOk <- isDefEqValueAt depth dom a1 a2
+          if not argOk
+            then do
+              traceFail
+                PhDefEq
+                TkSpine
+                TraceSummary
+                "defeq.spine.app.argMismatch"
+                [ ("domain", TrValueHead dom),
+                  ("lhsArg", TrValueHead a1),
+                  ("rhsArg", TrValueHead a2)
+                ]
+              traceEvent
+                PhDefEq
+                TkSpine
+                TraceDump
+                "defeq.spine.app.argMismatch.full"
+                [ ("domain", TrValue dom),
+                  ("lhsArg", TrValue a1),
+                  ("rhsArg", TrValue a2)
+                ]
+              pure False
+            else do
+              nextTy <- evalM (a1 : closureEnv clo) (closureBody clo)
+              nextVal <- applyElimM depth currentVal (EApp a1)
+              isDefEqSpineAt depth nextTy nextVal xs ys
+        _ -> pure False
+    (EProj n1 i1 : xs, EProj n2 i2 : ys)
+      | n1 == n2 && i1 == i2 -> do
+          r <-
+            (Just <$> applyTypeElimAndVal depth (currentTy, currentVal) (EProj n1 i1))
+              `catchError` \_ -> pure Nothing
+          case r of
+            Nothing ->
+              pure False
+            Just (nextTy, nextVal) ->
+              isDefEqSpineAt depth nextTy nextVal xs ys
+    _ -> do
+      traceFail
+        PhDefEq
+        TkSpine
+        TraceSummary
+        "defeq.spine.app.nonPi"
+        [("currentTy", TrValueHead currentTy)]
+      pure False
 
 -- | Step through the type by applying eliminations
 applyTypeElimAndVal :: Int -> (Value, Value) -> Elim -> KernelM (Value, Value)
@@ -1240,10 +1501,6 @@ isDefEqExprCore depth env expr1 expr2 = traceBlock PhDefEq TkCompare TraceDetail
       val2 <- evalM env expr2
       isDefEqValue depth val1 val2
 
-isDefEqSpine :: Int -> Spine -> Spine -> KernelM Bool
-isDefEqSpine depth s1 s2 = traceBlock PhDefEq TkSpine TraceDetail "defeq.spine" [("depth", TrInt depth), ("lhsLen", TrInt (length s1)), ("rhsLen", TrInt (length s2))] $ do
-  if length s1 /= length s2 then pure False else and <$> zipWithM (isDefEqElim depth) s1 s2
-
 isDefEqElim :: Int -> Elim -> Elim -> KernelM Bool
 isDefEqElim depth (EApp v1) (EApp v2) = isDefEqValue depth v1 v2
 isDefEqElim _ (EProj n1 i1) (EProj n2 i2) = pure (n1 == n2 && i1 == i2)
@@ -1333,3 +1590,27 @@ quoteElim depth headExpr (EApp argVal) = do
   mkApp headExpr argExpr
 quoteElim _ headExpr (EProj name idx) =
   mkProj name idx headExpr
+
+--------------------------------------------------------------------------------
+
+debugQuoteValue :: Int -> String -> Value -> KernelM ()
+debugQuoteValue depth label v = do
+  r <-
+    (Right <$> (quote depth =<< whnf depth v))
+      `catchError` \err -> pure (Left err)
+
+  case r of
+    Right e ->
+      traceEvent
+        PhInfer
+        TkEvent
+        TraceDump
+        label
+        [("expr", TrExpr e)]
+    Left err ->
+      traceEvent
+        PhInfer
+        TkEvent
+        TraceDump
+        (label <> ".failed")
+        [("error", TrString err)]

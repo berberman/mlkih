@@ -124,14 +124,24 @@ lookupLocalType lvl = do
   ctx <- asks checkLocalCtx
   case IntMap.lookup lvl ctx of
     Just decl -> pure $ localType decl
-    Nothing -> throwError "Unbound free variable in local context"
+    Nothing ->
+      throwError $
+        "Unbound free variable in local context: level "
+          <> toString lvl
+          <> ", available levels = "
+          <> toString (IntMap.keys ctx)
 
 lookupLocalValue :: Int -> KernelM (Maybe Value)
 lookupLocalValue lvl = do
   ctx <- asks checkLocalCtx
   case IntMap.lookup lvl ctx of
     Just decl -> pure $ localValue decl
-    Nothing -> throwError "Unbound free variable in local context"
+    Nothing ->
+      throwError $
+        "Unbound free variable in local context: level "
+          <> toString lvl
+          <> ", available levels = "
+          <> toString (IntMap.keys ctx)
 
 lookupInducVal :: HCName -> KernelM (InductiveVal HCExpr HCLevel)
 lookupInducVal indName = do

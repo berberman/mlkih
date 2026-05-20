@@ -1,2 +1,3 @@
 dist-newstyle
 *.exported.ndjson
+*.trace
