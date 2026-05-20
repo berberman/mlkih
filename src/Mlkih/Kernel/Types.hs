@@ -291,52 +291,59 @@ instance PrettyPrint TraceField where
     group $
       cyan (ppr key)
         <> dim (ppr '=')
-        <> align (ppTraceFieldValue val)
-    where
-      ppTraceFieldValue fieldVal =
-        case fieldVal of
-          TrString str -> ppr str
-          TrDoc doc -> doc
-          TrInt n -> ppr n
-          TrBool b -> ppr (show b)
-          TrName n -> ppr n
-          TrLevel lvl -> ppr lvl
-          TrExpr expr -> ppr expr
-          TrValue value -> ppr value
-          TrValueHead value -> ppValueHead value
-          TrHead h -> ppr h
-          TrElim elim -> ppr elim
-          TrSpine sp -> brackets (hcatWithComma (map ppr sp))
-          TrSpineLen sp -> ppr (length sp)
-      ppValueHead value =
-        case value of
-          VSort lvl ->
-            yellow (ppr "Sort") <+> ppr lvl
-          VLit lit ->
-            cyan (ppr "Lit") <+> ppr lit
-          VLam n _ _ _ ->
-            magenta (ppr "Lam") <+> ppr n
-          VPi n _ _ _ ->
-            magenta (ppr "Pi") <+> ppr n
-          VNeutral h sp ->
-            group $
-              red (ppr "Neutral")
-                <+> align
-                  ( sep
-                      [ ppr h,
-                        dim (ppr "spineLen=" <> ppr (length sp))
-                      ]
-                  )
-          VDef n lvls sp ->
-            group $
-              blue (ppr "Def")
-                <+> align
-                  ( sep
-                      [ ppr n,
-                        dim (brackets (hcatWithComma (map ppr lvls))),
-                        dim (ppr "spineLen=" <> ppr (length sp))
-                      ]
-                  )
+        <> align (ppTraceFieldValue [] val)
+
+type ValueBinderCtx = [Maybe HCName]
+
+ppTraceFieldValue :: ValueBinderCtx -> TraceFieldValue -> Doc
+ppTraceFieldValue ctx fieldVal =
+  case fieldVal of
+    TrString str -> ppr str
+    TrDoc doc -> doc
+    TrInt n -> ppr n
+    TrBool b -> ppr b
+    TrName n -> ppr n
+    TrLevel lvl -> ppr lvl
+    TrExpr expr -> pprNamedExpr ctx expr
+    TrValue value -> pprNamedValue ctx value
+    TrValueHead value -> ppValueHead ctx value
+    TrHead h -> ppr h
+    TrElim elim -> pprNamedElim ctx elim
+    TrSpine sp -> pprNamedSpine ctx sp
+    TrSpineLen sp -> ppr (length sp)
+
+ppValueHead :: ValueBinderCtx -> Value -> Doc
+ppValueHead ctx value =
+  case value of
+    VSort lvl ->
+      yellow (ppr "Sort") <+> ppr lvl
+    VLit lit ->
+      cyan (ppr "Lit") <+> ppr lit
+    VLam n _ _ _ ->
+      magenta (ppr "Lam") <+> ppr n
+    VPi n _ _ _ ->
+      magenta (ppr "Pi") <+> ppr n
+    VNeutral h sp ->
+      group $
+        red (ppr "Neutral")
+          <+> align
+            ( sep
+                [ ppr h,
+                  dim (ppr "spineLen=" <> ppr (length sp)),
+                  dim (ppr "spine=") <> pprNamedSpine ctx sp
+                ]
+            )
+    VDef n lvls sp ->
+      group $
+        blue (ppr "Def")
+          <+> align
+            ( sep
+                [ ppr n,
+                  dim (brackets (hcatWithComma (map ppr lvls))),
+                  dim (ppr "spineLen=" <> ppr (length sp)),
+                  dim (ppr "spine=") <> pprNamedSpine ctx sp
+                ]
+            )
 
 instance PrettyPrint TraceVerbosity where
   ppr v = case v of
@@ -431,30 +438,40 @@ data Value
   deriving (Show)
 
 instance PrettyPrint Closure where
-  ppr (Closure env body) =
-    group $
-      dim (ppr "Closure")
-        <+> dim
-          ( braces $
-              align $
-                sep
-                  [ ppr "env:" <+> brackets (hcatWithComma (map ppr env)),
-                    ppr "body:" <+> ppr body
-                  ]
-          )
+  ppr = pprNamedClosure []
+
+pprNamedClosure :: ValueBinderCtx -> Closure -> Doc
+pprNamedClosure ctx (Closure env body) =
+  group $
+    dim (ppr "Closure")
+      <+> dim
+        ( braces $
+            align $
+              sep
+                [ ppr "env:" <+> brackets (hcatWithComma (map (pprNamedValue ctx) env)),
+                  ppr "body:" <+> pprNamedExpr ctx body
+                ]
+        )
 
 instance PrettyPrint Elim where
-  ppr elim =
-    case elim of
-      EApp arg ->
-        group $ bold (magenta (ppr "EApp")) <+> dim (parens (align (ppr arg)))
-      EProj projName idx ->
-        group $
-          bold (magenta (ppr "EProj"))
-            <+> dim
-              ( parens $
-                  green (ppr projName) <> dim (ppr '.') <> cyan (ppr idx)
-              )
+  ppr = pprNamedElim []
+
+pprNamedElim :: ValueBinderCtx -> Elim -> Doc
+pprNamedElim ctx elim =
+  case elim of
+    EApp arg ->
+      group $ bold (magenta (ppr "EApp")) <+> dim (parens (align (pprNamedValue ctx arg)))
+    EProj projName idx ->
+      group $
+        bold (magenta (ppr "EProj"))
+          <+> dim
+            ( parens $
+                green (ppr projName) <> dim (ppr '.') <> cyan (ppr idx)
+            )
+
+pprNamedSpine :: ValueBinderCtx -> Spine -> Doc
+pprNamedSpine ctx spine =
+  brackets (hcatWithComma (map (pprNamedElim ctx) spine))
 
 instance PrettyPrint Head where
   ppr head =
@@ -467,31 +484,34 @@ instance PrettyPrint Head where
             else dim (brackets (hcatWithComma (map ppr levels)))
 
 instance PrettyPrint Value where
-  ppr val =
-    case val of
-      VSort lvl ->
-        yellow (ppr "VSort") <+> parens (ppr lvl)
-      VLit lit ->
-        cyan (ppr "VLit") <+> parens (ppr lit)
-      VLam name binderInfo ty body ->
-        ppValueBinder (magenta (ppr "VLam")) name binderInfo ty body
-      VPi name binderInfo ty body ->
-        ppValueBinder (bold (magenta (ppr "VPi"))) name binderInfo ty body
-      VNeutral head spine ->
-        ppValueApp (red (ppr "VNeutral")) [ppr head, ppr spine]
-      VDef name levels spine ->
-        ppValueApp (blue (ppr "VDef")) [ppr name, ppr levels, ppr spine]
+  ppr = pprNamedValue []
 
-ppValueBinder :: Doc -> HCName -> BinderInfo -> Value -> Closure -> Doc
-ppValueBinder keyword name binderInfo ty body =
+pprNamedValue :: ValueBinderCtx -> Value -> Doc
+pprNamedValue ctx val =
+  case val of
+    VSort lvl ->
+      yellow (ppr "VSort") <+> parens (ppr lvl)
+    VLit lit ->
+      cyan (ppr "VLit") <+> parens (ppr lit)
+    VLam name binderInfo ty body ->
+      ppValueBinder ctx (magenta (ppr "VLam")) name binderInfo ty body
+    VPi name binderInfo ty body ->
+      ppValueBinder ctx (bold (magenta (ppr "VPi"))) name binderInfo ty body
+    VNeutral head spine ->
+      ppValueApp (red (ppr "VNeutral")) [ppr head, pprNamedSpine ctx spine]
+    VDef name levels spine ->
+      ppValueApp (blue (ppr "VDef")) [ppr name, ppr levels, pprNamedSpine ctx spine]
+
+ppValueBinder :: ValueBinderCtx -> Doc -> HCName -> BinderInfo -> Value -> Closure -> Doc
+ppValueBinder ctx keyword name binderInfo ty body =
   group $
     keyword
       <+> parens
         ( align $
             sep
-              [ ppBinder binderInfo name ty,
+              [ ppBinder binderInfo name (pprNamedValue ctx ty),
                 magenta (ppr "=>"),
-                ppr body
+                pprNamedClosure (Just name : ctx) body
               ]
         )
 

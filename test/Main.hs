@@ -40,7 +40,7 @@ main = do
   -- defaultMain tests
 
   parsed <- loadParsedLeanFixture tutorialFixture
-  state <- expectRightKernel $ withTraceVerbosity TraceSummary  $ withFullTrace $ checkParsedExport parsed
+  state <- expectRightKernel $ withTraceVerbosity TraceSummary  $ checkParsedExport parsed
   printKernelTrace state
   -- result <- parseExportFileWithState "export.exported.ndjson"
   -- case result of

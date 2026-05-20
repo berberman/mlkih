@@ -51,51 +51,78 @@ data Expr' e l n
   | Proj n Int e
   deriving (Show, Eq, Ord)
 
-instance (PrettyPrint e, PrettyPrint l, PrettyPrint n) => PrettyPrint (Expr' e l n) where
-  ppr expr =
-    case expr of
-      BVar idx -> cyan (ppr '#' <> ppr idx)
-      Sort level -> bold (yellow (ppr "Sort")) <> dim (parens (ppr level))
-      Const name levels ->
+type BinderCtx n = [Maybe n]
+
+pprExprValWith ::
+  (PrettyPrint l, PrettyPrint n) =>
+  (BinderCtx n -> e -> Doc) ->
+  BinderCtx n ->
+  Expr' e l n ->
+  Doc
+pprExprValWith ppExpr ctx expr =
+  case expr of
+    BVar idx ->
+      pprBVar ctx idx
+    Sort level ->
+      bold (yellow (ppr "Sort")) <> dim (parens (ppr level))
+    Const name levels ->
+      green (ppr name)
+        <> if null levels
+          then ppr ""
+          else dim (brackets (hcatWithComma (fmap ppr levels)))
+    App fn arg ->
+      ppParens (sep [ppExpr ctx fn, ppExpr ctx arg])
+    Lam name ty body binderInfo ->
+      ppParens
+        ( sep
+            [ magenta (ppr "λ") <+> ppBinder binderInfo name (ppExpr ctx ty),
+              magenta (ppr "=>") <+> ppExpr (Just name : ctx) body
+            ]
+        )
+    ForallE name ty body binderInfo ->
+      ppParens
+        ( sep
+            [ magenta (ppr "∀") <+> ppBinder binderInfo name (ppExpr ctx ty) <> magenta (ppr ","),
+              ppExpr (Just name : ctx) body
+            ]
+        )
+    Lit lit ->
+      ppr lit
+    Let name ty value body nondep ->
+      ppParens
+        ( sep
+            [ ( if nondep
+                  then magenta (ppr "have")
+                  else magenta (ppr "let")
+              )
+                <+> ppr name
+                <+> dim (ppr ":")
+                <+> ppExpr ctx ty,
+              magenta (ppr ":=") <+> ppExpr ctx value <> magenta (ppr ";"),
+              ppExpr (Just name : ctx) body
+            ]
+        )
+    Proj name idx struct ->
+      group $
         green (ppr name)
-          <> if null levels
-            then ppr ""
-            else dim (brackets (hcatWithComma (fmap ppr levels)))
-      App fn arg ->
-        ppParens (sep [ppr fn, ppr arg])
-      Lam name ty body binderInfo ->
-        ppParens
-          ( sep
-              [ magenta (ppr "λ") <+> ppBinder binderInfo name ty,
-                magenta (ppr "=>") <+> ppr body
-              ]
-          )
-      ForallE name ty body binderInfo ->
-        ppParens
-          ( sep
-              [ magenta (ppr "∀") <+> ppBinder binderInfo name ty <> magenta (ppr ","),
-                ppr body
-              ]
-          )
-      Lit lit -> ppr lit
-      Let name ty value body nondep ->
-        ppParens
-          ( sep
-              [ ( if nondep
-                    then magenta (ppr "have")
-                    else magenta (ppr "let")
-                )
-                  <+> ppr name
-                  <+> dim (ppr ':')
-                  <+> ppr ty,
-                magenta (ppr ":=") <+> ppr value <> magenta (ppr ";"),
-                ppr body
-              ]
-          )
-      Proj name idx struct ->
-        group (green (ppr name) <> dim (ppr '.') <> cyan (ppr idx) <> dim (parens (ppr struct)))
-    where
-      ppParens doc = group (dim (ppr '(') <> align doc <> dim (ppr ')'))
+          <> dim (ppr ".")
+          <> cyan (ppr idx)
+          <> dim (parens (ppExpr ctx struct))
+  where
+    ppParens doc =
+      group (dim (ppr "(") <> align doc <> dim (ppr ")"))
+
+pprBVar :: (PrettyPrint n) => BinderCtx n -> Int -> Doc
+pprBVar ctx idx =
+  case drop idx ctx of
+    Just name : _ -> ppr name
+    _ -> cyan (ppr "#" <> ppr idx)
+
+lookupBoundName :: Int -> [n] -> Maybe n
+lookupBoundName idx _ | idx < 0 = Nothing
+lookupBoundName 0 (name : _) = Just name
+lookupBoundName idx (_ : rest) = lookupBoundName (idx - 1) rest
+lookupBoundName _ [] = Nothing
 
 ppBinder :: (PrettyPrint ty, PrettyPrint name) => BinderInfo -> name -> ty -> Doc
 ppBinder binderInfo name ty =
@@ -108,6 +135,20 @@ ppBinder binderInfo name ty =
         Implicit -> dim (ppr '{') <> inner <> dim (ppr '}')
         StrictImplicit -> dim (ppr "{{") <> inner <> dim (ppr "}}")
         InstImplicit -> dim (ppr '[') <> inner <> dim (ppr ']')
+
+instance (PrettyPrint e, PrettyPrint l, PrettyPrint n) => PrettyPrint (Expr' e l n) where
+  ppr = pprExprValWith (const ppr) []
+
+pprNamedExpr ::
+  ( HasExpr e,
+    PrettyPrint (LevelOf e),
+    PrettyPrint (NameOf e)
+  ) =>
+  BinderCtx (NameOf e) ->
+  e ->
+  Doc
+pprNamedExpr ctx expr =
+  pprExprValWith pprNamedExpr ctx (getExpr expr)
 
 instance (Hashable e, Hashable l, Hashable n) => Hashable (Expr' e l n) where
   hashWithSalt salt expr =
@@ -158,7 +199,7 @@ instance HasExpr HCExpr where
   getExpr = hceVal
 
 instance PrettyPrint Expr where
-  ppr = ppr . getExpr
+  ppr = pprNamedExpr []
 
 instance PrettyPrint HCExpr where
-  ppr = ppr . getExpr
+  ppr = pprNamedExpr []

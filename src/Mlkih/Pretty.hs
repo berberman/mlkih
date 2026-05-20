@@ -69,6 +69,9 @@ instance PrettyPrint () where
 instance PrettyPrint Int where
   ppr = pretty
 
+instance PrettyPrint Bool where
+  ppr = pretty
+
 instance PrettyPrint T.Text where
   ppr = pretty
 
