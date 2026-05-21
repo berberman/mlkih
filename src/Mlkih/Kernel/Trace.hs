@@ -35,6 +35,7 @@ import Control.Monad.State.Strict
 import Mlkih.Kernel.Types
 import Mlkih.Name
 import Mlkih.Pretty
+import System.IO
 
 defaultTraceConfig :: TraceConfig
 defaultTraceConfig =
@@ -43,7 +44,8 @@ defaultTraceConfig =
       tracePhases = Nothing,
       traceKinds = Nothing,
       traceOutcomes = Nothing,
-      traceConstants = Nothing
+      traceConstants = Nothing,
+      traceStream = False
     }
 
 maxTraceConfig :: TraceConfig
@@ -53,7 +55,8 @@ maxTraceConfig =
       tracePhases = Nothing,
       traceKinds = Nothing,
       traceOutcomes = Nothing,
-      traceConstants = Nothing
+      traceConstants = Nothing,
+      traceStream = False
     }
 
 matchesMaybe :: (Eq a) => Maybe [a] -> a -> Bool
@@ -162,8 +165,12 @@ popTraceBlock ev =
 traceEmit :: TraceEvent -> KernelM ()
 traceEmit ev = do
   active <- shouldTraceEvent ev
-  when active $
+  when active $ do
     appendTraceNode (TraceLeaf ev)
+    stream <- asks (traceStream . checkTraceConfig)
+    liftIO $ when stream $ do
+      hPutStrLn stderr (renderPlain . ppr $ TraceLeaf ev)
+      hFlush stderr
 
 traceEvent ::
   TracePhase ->

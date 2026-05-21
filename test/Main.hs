@@ -41,7 +41,16 @@ main = do
   -- parsed <- expectRight =<< parseExportFileWithState "export.exported.ndjson"
   -- putStrLn "Parsed export file successfully, checking..."
   parsed <- loadParsedLeanFixture fooFixture
-  state <- expectRightKernel $ withTraceConfig (defaultTraceConfig {traceOutcomes = Just [OutFail], traceVerbosity = TraceSummary}) $ checkParsedExport parsed
+  state <-
+    expectRightKernel
+      -- $ withTraceConfig
+      --   ( defaultTraceConfig
+      --       { traceOutcomes = Nothing,
+      --         traceVerbosity = TraceSummary,
+      --         traceStream = True
+      --       }
+      --   )
+      $ checkParsedExport parsed
 
   pure ()
 

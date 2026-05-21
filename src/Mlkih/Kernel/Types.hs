@@ -101,7 +101,9 @@ data KernelState = KernelState
     checkInternState :: !InternState,
     checkClosedDefEqActive :: ![ClosedDefEqKey],
     checkClosedDefEqCache :: !(Map ClosedDefEqKey Bool),
-    checkTraceStack :: ![[TraceNode]]
+    checkTraceStack :: ![[TraceNode]],
+    checkReductionFuel :: !Int,
+    checkReductionStack :: ![ReductionFrame]
   }
 
 instance HasInternState KernelState where
@@ -173,6 +175,48 @@ instance MonadIO KernelM where
   {-# INLINE liftIO #-}
 
 --------------------------------------------------------------------------------
+data ReductionFrame
+  = RFWhnf
+      { rfDepth :: !Int,
+        rfConst :: !HCName,
+        rfSpineLen :: !Int
+      }
+  | RFUnfoldVDef
+      { rfDepth :: !Int,
+        rfConst :: !HCName,
+        rfSpineLen :: !Int
+      }
+  | RFApplyElim
+      { rfDepth :: !Int,
+        rfValue :: !Doc,
+        rfElim :: !Doc
+      }
+  | RFDefEqValue
+      { rfDepth :: !Int,
+        rfLhs :: !Doc,
+        rfRhs :: !Doc
+      }
+  | RFRecursorMajor
+      { rfDepth :: !Int,
+        rfRecursor :: !HCName,
+        rfMajor :: !Doc
+      }
+
+instance PrettyPrint ReductionFrame where
+  ppr frame =
+    case frame of
+      RFWhnf depth const spineLen ->
+        ppr "WHNF" <+> parens (ppr const <> dim (brackets (ppr spineLen))) <+> dim (parens (ppr depth))
+      RFUnfoldVDef depth const spineLen ->
+        ppr "UnfoldVDef" <+> parens (ppr const <> dim (brackets (ppr spineLen))) <+> dim (parens (ppr depth))
+      RFApplyElim depth val elim ->
+        ppr "ApplyElim" <+> parens (val <> dim (parens elim)) <+> dim (parens (ppr depth))
+      RFDefEqValue depth lhs rhs ->
+        ppr "DefEqValue" <+> parens (lhs <> dim (ppr "==") <> rhs) <+> dim (parens (ppr depth))
+      RFRecursorMajor depth rec major ->
+        ppr "RecursorMajor" <+> parens (ppr rec <> dim (ppr "major=") <> major) <+> dim (parens (ppr depth))
+
+--------------------------------------------------------------------------------
 
 type TraceField = (String, TraceFieldValue)
 
@@ -196,7 +240,8 @@ data TraceConfig = TraceConfig
     tracePhases :: !(Maybe [TracePhase]),
     traceKinds :: !(Maybe [TraceKind]),
     traceOutcomes :: !(Maybe [TraceOutcome]),
-    traceConstants :: !(Maybe [HCName])
+    traceConstants :: !(Maybe [HCName]),
+    traceStream :: !Bool
   }
 
 data TraceNode

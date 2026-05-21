@@ -34,10 +34,12 @@ module Mlkih.Kernel.Monad
     initialProgressState,
     withKernelConsoleProgress,
     runKernelMWithProgress,
+    tickReduction,
+    withReductionFrame,
   )
 where
 
-import Control.Exception (onException)
+import Control.Monad (when)
 import Control.Monad.Error.Class
 import Control.Monad.Reader.Class
 import Control.Monad.State.Strict
@@ -65,7 +67,9 @@ emptyKernelState env =
       checkInternState = emptyInternState,
       checkClosedDefEqActive = [],
       checkClosedDefEqCache = Map.empty,
-      checkTraceStack = []
+      checkTraceStack = [],
+      checkReductionFuel = 2000000,
+      checkReductionStack = []
     }
 
 emptyKernelCtx :: KernelCtx
@@ -105,6 +109,27 @@ runKernelWithTraceIO env internSt action = do
     Left err -> putStrLn $ "❌ Kernel Error: " ++ err
     Right _ -> putStrLn "✅ Kernel Execution Succeeded."
   pure (result, checkInternState finalState)
+
+------------------------------------------------------------
+tickReduction :: String -> KernelM ()
+tickReduction label = do
+  fuel <- gets checkReductionFuel
+  when (fuel <= 0) $ do
+    stack <- gets checkReductionStack
+    throwError $
+      "reduction fuel exhausted at "
+        <> label
+        <> "\nstack:\n"
+        <> unlines (map (renderPlain . ppr) (take 80 stack))
+
+  modify' $ \s ->
+    s {checkReductionFuel = fuel - 1}
+
+withReductionFrame :: ReductionFrame -> KernelM a -> KernelM a
+withReductionFrame frame k = do
+  modify' $ \s -> s {checkReductionStack = frame : checkReductionStack s}
+  k
+    `finallyM` modify' (\s -> s {checkReductionStack = drop 1 (checkReductionStack s)})
 
 ------------------------------------------------------------
 

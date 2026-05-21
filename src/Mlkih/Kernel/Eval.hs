@@ -260,7 +260,15 @@ reduceRecursor depth recName recLvls recVal newSpine = do
       "recursor.major.whnf"
       [("recursor", TrName recName)]
 
-  whnfMajor <- lift $ whnf depth (recMajor recArgs)
+  whnfMajor <-
+    lift
+      $ withReductionFrame
+        RFRecursorMajor
+          { rfDepth = depth,
+            rfRecursor = recName,
+            rfMajor = ppValueHead [] (recMajor recArgs)
+          }
+      $ whnf depth (recMajor recArgs)
   normalizedMajor <- lift $ expandLiteralCtor whnfMajor
 
   case normalizedMajor of
@@ -464,32 +472,35 @@ reduceProjection structName fieldIdx headName ctorSpineRev = do
 
 -- | Push an elimination onto a WHNF Value
 applyElimM :: Int -> Value -> Elim -> KernelM Value
-applyElimM depth val elim = traceBlock PhReduce TkReduction TraceSummary "apply.elim" [("depth", TrInt depth), ("value", TrValueHead val), ("elim", TrElim elim)] $
-  case (val, elim) of
-    -- Beta reduction
-    (VLam _ _ _ (Closure env body), EApp argVal) -> do
-      traceProgress PhReduce TkReduction TraceDetail "beta.reduce" [("arg", TrValueHead argVal)]
-      evalM depth (argVal : env) body
-    -- Projection reduction
-    (VNeutral (HConst ctorName ctorLvls) spine, EProj structName projIdx) -> do
-      let newSpine = EProj structName projIdx : spine
-      runReduction ctorName ctorLvls newSpine $
-        reduceProjection structName projIdx ctorName spine
-    -- Iota reduction
-    (VNeutral (HConst headName lvls) spine, _) -> do
-      let newSpine = elim : spine
-      runReduction headName lvls newSpine $
-        reduceNeutralConst depth headName lvls newSpine
-    ((VNeutral head spine), elim) -> do
-      traceEvent PhReduce TkSpine TraceDetail "neutral.spine.push" [("head", TrHead head), ("oldLen", TrInt (length spine)), ("newLen", TrInt (length spine + 1))]
-      pure $ VNeutral head (elim : spine)
-    ((VDef name levels spine), elim) -> do
-      traceEvent PhReduce TkSpine TraceDetail "vdef.spine.push" [("const", TrName name), ("oldLen", TrInt (length spine)), ("newLen", TrInt (length spine + 1))]
-      let newSpine = elim : spine
-      pure $ VDef name levels newSpine
-    _ -> do
-      traceFail PhReduce TkFailure TraceSummary "apply.illtyped" [("value", TrValueHead val), ("elim", TrElim elim)]
-      throwError "Ill-typed application"
+applyElimM depth val elim = do
+  tickReduction "applyElimM"
+  withReductionFrame (RFApplyElim depth (ppValueHead [] val) (ppr elim)) $
+    traceBlock PhReduce TkReduction TraceSummary "apply.elim" [("depth", TrInt depth), ("value", TrValueHead val), ("elim", TrElim elim)] $
+      case (val, elim) of
+        -- Beta reduction
+        (VLam _ _ _ (Closure env body), EApp argVal) -> do
+          traceProgress PhReduce TkReduction TraceDetail "beta.reduce" [("arg", TrValueHead argVal)]
+          evalM depth (argVal : env) body
+        -- Projection reduction
+        (VNeutral (HConst ctorName ctorLvls) spine, EProj structName projIdx) -> do
+          let newSpine = EProj structName projIdx : spine
+          runReduction ctorName ctorLvls newSpine $
+            reduceProjection structName projIdx ctorName spine
+        -- Iota reduction
+        (VNeutral (HConst headName lvls) spine, _) -> do
+          let newSpine = elim : spine
+          runReduction headName lvls newSpine $
+            reduceNeutralConst depth headName lvls newSpine
+        ((VNeutral head spine), elim) -> do
+          traceEvent PhReduce TkSpine TraceDetail "neutral.spine.push" [("head", TrHead head), ("oldLen", TrInt (length spine)), ("newLen", TrInt (length spine + 1))]
+          pure $ VNeutral head (elim : spine)
+        ((VDef name levels spine), elim) -> do
+          traceEvent PhReduce TkSpine TraceDetail "vdef.spine.push" [("const", TrName name), ("oldLen", TrInt (length spine)), ("newLen", TrInt (length spine + 1))]
+          let newSpine = elim : spine
+          pure $ VDef name levels newSpine
+        _ -> do
+          traceFail PhReduce TkFailure TraceSummary "apply.illtyped" [("value", TrValueHead val), ("elim", TrElim elim)]
+          throwError "Ill-typed application"
 
 applyElimsM :: Int -> Value -> Spine -> KernelM Value
 applyElimsM depth baseVal spine =
@@ -497,16 +508,18 @@ applyElimsM depth baseVal spine =
     foldM (applyElimM depth) baseVal (reverse spine)
 
 unfoldVDefOne :: Int -> HCName -> [HCLevel] -> Spine -> KernelM Value
-unfoldVDefOne depth name levels spineRev =
-  traceBlock
-    PhDefEq
-    TkUnfold
-    TraceDetail
-    "defeq.vdef.unfold.one"
-    [ ("const", TrName name),
-      ("levels", TrDoc (ppr levels)),
-      ("spineLen", TrInt (length spineRev))
-    ]
+unfoldVDefOne depth name levels spineRev = do
+  tickReduction "unfoldVDefOne"
+  withReductionFrame (RFUnfoldVDef depth name (length spineRev))
+    $ traceBlock
+      PhDefEq
+      TkUnfold
+      TraceDetail
+      "defeq.vdef.unfold.one"
+      [ ("const", TrName name),
+        ("levels", TrDoc (ppr levels)),
+        ("spineLen", TrInt (length spineRev))
+      ]
     $ do
       mInfo <- lookupConstInfo name
       case mInfo of
@@ -674,38 +687,68 @@ unfoldVDefsByHint depth lhs rhs =
 whnf :: Int -> Value -> KernelM Value
 whnf depth v = case v of
   VDef name lvls spineRev -> do
-    traceBlock
-      PhReduce
-      TkWHNF
-      TraceSummary
-      "whnf.vdef"
-      [ ("const", TrName name),
-        ("spineLen", TrInt (length spineRev))
-      ]
-      $ do
-        v' <- unfoldVDefOne depth name lvls spineRev
-        whnf depth v'
+    tickReduction "whnf.vdef"
+    withReductionFrame (RFWhnf depth name (length spineRev)) $ do
+      traceBlock
+        PhReduce
+        TkWHNF
+        TraceSummary
+        "whnf.vdef"
+        [ ("const", TrName name),
+          ("spineLen", TrInt (length spineRev))
+        ]
+        $ do
+          v' <- unfoldVDefOne depth name lvls spineRev
+          whnf depth v'
   _ -> pure v
 
 --------------------------------------------------------------------------------
 
 isPropType :: Int -> Value -> KernelM Bool
-isPropType depth ty = do
-  tySort <- inferValue depth ty
-  whnfTySort <- whnf depth tySort
-  zero <- mkLevelZero
-  case whnfTySort of
-    VSort lvl -> pure (lvl == zero || levelEquiv lvl zero)
-    _ -> pure False
+isPropType depth ty =
+  traceBlock
+    PhDefEq
+    TkCompare
+    TraceDetail
+    "defeq.isPropType"
+    [ ("depth", TrInt depth),
+      ("type", TrValueHead ty)
+    ]
+    $ do
+      tySort <- inferValue depth ty
+      whnfTySort <- whnf depth tySort
+      zero <- mkLevelZero
+      let result =
+            case whnfTySort of
+              VSort lvl -> lvl == zero || levelEquiv lvl zero
+              _ -> False
+      traceEvent
+        PhDefEq
+        TkCompare
+        TraceDetail
+        "defeq.isPropType.result"
+        [ ("sort", TrValueHead whnfTySort),
+          ("result", TrBool result)
+        ]
+
+      pure result
 
 -- | Compare two values at a known expected type.
 isDefEqValueAt :: Int -> Value -> Value -> Value -> KernelM Bool
-isDefEqValueAt depth expectedTy v1 v2 = do
-  same <- isDefEqValue depth v1 v2
-  if same
-    then pure True
-    else do
+isDefEqValueAt depth expectedTy v1 v2 =
+  traceBlock
+    PhDefEq
+    TkCompare
+    TraceDetail
+    "defeq.valueAt"
+    [ ("depth", TrInt depth),
+      ("expected", TrValueHead expectedTy),
+      ("lhs", TrValueHead v1),
+      ("rhs", TrValueHead v2)
+    ]
+    $ do
       isProp <- isPropType depth expectedTy
+
       if isProp
         then do
           traceOk
@@ -716,41 +759,43 @@ isDefEqValueAt depth expectedTy v1 v2 = do
             [("expectedType", TrValueHead expectedTy)]
           pure True
         else
-          pure False
+          isDefEqValue depth v1 v2
 
 --------------------------------------------------------------------------------
 
 isDefEqValue :: Int -> Value -> Value -> KernelM Bool
-isDefEqValue depth val1 val2 = traceBlock PhDefEq TkCompare TraceSummary "defeq.value" [("depth", TrInt depth), ("lhs", TrValueHead val1), ("rhs", TrValueHead val2)] $ do
-  traceEvent PhDefEq TkCompare TraceDump "defeq.value.full" [("lhs", TrValue val1), ("rhs", TrValue val2)]
-  case (val1, val2) of
-    (VSort l1, VSort l2) -> do
-      let eq = l1 == l2 || levelEquiv l1 l2
-      if eq
-        then traceOk PhDefEq TkCompare TraceSummary "defeq.levels" [("lhs", TrLevel l1), ("rhs", TrLevel l2)]
-        else traceFail PhDefEq TkCompare TraceSummary "defeq.levels" [("lhs", TrLevel l1), ("rhs", TrLevel l2)]
-      pure eq
-    (VLit lit1, VLit lit2) -> do
-      let eq = lit1 == lit2
-      if eq
-        then traceOk PhDefEq TkCompare TraceSummary "defeq.literals" [("lhs", TrDoc (ppr lit1)), ("rhs", TrDoc (ppr lit2))]
-        else traceFail PhDefEq TkCompare TraceSummary "defeq.literals" [("lhs", TrDoc (ppr lit1)), ("rhs", TrDoc (ppr lit2))]
-      pure eq
-    _ -> do
-      val1 <- expandLiteralCtor val1
-      val2 <- expandLiteralCtor val2
-      z1 <- tryZeta val1
-      case z1 of
-        Just u1 -> do
-          traceProgress PhDefEq TkReduction TraceDetail "zeta.lhs" [("level", TrValueHead val1)]
-          isDefEqValue depth u1 val2
-        Nothing -> do
-          z2 <- tryZeta val2
-          case z2 of
-            Just u2 -> do
-              traceProgress PhDefEq TkReduction TraceDetail "zeta.rhs" [("level", TrValueHead val2)]
-              isDefEqValue depth val1 u2
-            Nothing -> matchCore val1 val2
+isDefEqValue depth val1 val2 =
+  withReductionFrame (RFDefEqValue depth (ppValueHead [] val1) (ppValueHead [] val2)) $
+    traceBlock PhDefEq TkCompare TraceSummary "defeq.value" [("depth", TrInt depth), ("lhs", TrValueHead val1), ("rhs", TrValueHead val2)] $ do
+      traceEvent PhDefEq TkCompare TraceDump "defeq.value.full" [("lhs", TrValue val1), ("rhs", TrValue val2)]
+      case (val1, val2) of
+        (VSort l1, VSort l2) -> do
+          let eq = l1 == l2 || levelEquiv l1 l2
+          if eq
+            then traceOk PhDefEq TkCompare TraceSummary "defeq.levels" [("lhs", TrLevel l1), ("rhs", TrLevel l2)]
+            else traceFail PhDefEq TkCompare TraceSummary "defeq.levels" [("lhs", TrLevel l1), ("rhs", TrLevel l2)]
+          pure eq
+        (VLit lit1, VLit lit2) -> do
+          let eq = lit1 == lit2
+          if eq
+            then traceOk PhDefEq TkCompare TraceSummary "defeq.literals" [("lhs", TrDoc (ppr lit1)), ("rhs", TrDoc (ppr lit2))]
+            else traceFail PhDefEq TkCompare TraceSummary "defeq.literals" [("lhs", TrDoc (ppr lit1)), ("rhs", TrDoc (ppr lit2))]
+          pure eq
+        _ -> do
+          val1 <- expandLiteralCtor val1
+          val2 <- expandLiteralCtor val2
+          z1 <- tryZeta val1
+          case z1 of
+            Just u1 -> do
+              traceProgress PhDefEq TkReduction TraceDetail "zeta.lhs" [("level", TrValueHead val1)]
+              isDefEqValue depth u1 val2
+            Nothing -> do
+              z2 <- tryZeta val2
+              case z2 of
+                Just u2 -> do
+                  traceProgress PhDefEq TkReduction TraceDetail "zeta.rhs" [("level", TrValueHead val2)]
+                  isDefEqValue depth val1 u2
+                Nothing -> matchCore val1 val2
   where
     tryZeta :: Value -> KernelM (Maybe Value)
     tryZeta (VNeutral (HLvl _ lvl) s) = do
@@ -1555,6 +1600,10 @@ checkStructEta depth ctorName spine otherVal = traceBlock PhEta TkCompare TraceD
     _ -> do
       traceStuck PhEta TkStuck TraceSummary "eta.structure.notCtor" [("head", TrName ctorName)]
       pure False
+
+--------------------------------------------------------------------------------
+
+
 
 --------------------------------------------------------------------------------
 
