@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeSynonymInstances #-}
@@ -49,10 +50,49 @@ data LocalDecl = LocalDecl
 type LocalCtx = IntMap LocalDecl
 
 --------------------------------------------------------------------------------
+data ProgressSubject
+  = ProgressConstant !HCName
+  | ProgressInductiveBlock !InductiveBlockProgress
+
+data InductiveBlockProgress = InductiveBlockProgress
+  { ibTypes :: ![HCName],
+    ibConstructorCount :: !Int,
+    ibRecursorCount :: !Int
+  }
+
+data ProgressState = ProgressState
+  { progressDone :: !Int,
+    progressTotal :: !Int,
+    progressCurrent :: !(Maybe ProgressSubject)
+  }
+
+data ProgressEvent
+  = ProgressCheckingDecl !Int !Int !ProgressSubject
+  | ProgressCheckedDecl !Int !Int !ProgressSubject
+  | ProgressMessage !Doc
+
+instance PrettyPrint ProgressSubject where
+  ppr subj =
+    case subj of
+      ProgressConstant name ->
+        ppr name
+      ProgressInductiveBlock block ->
+        ppr "inductive block"
+          <+> ppr (ibTypes block)
+          <+> dim
+            ( parens $
+                ppr (ibConstructorCount block)
+                  <+> ppr "ctors,"
+                  <+> ppr (ibRecursorCount block)
+                  <+> ppr "recs"
+            )
+
+--------------------------------------------------------------------------------
 
 data KernelCtx = KernelCtx
   { checkLocalCtx :: !LocalCtx,
-    checkTraceConfig :: !TraceConfig
+    checkTraceConfig :: !TraceConfig,
+    checkProgress :: !(ProgressEvent -> IO ())
   }
 
 data KernelState = KernelState
@@ -72,61 +112,65 @@ type KernelError = String
 
 --------------------------------------------------------------------------------
 
-newtype KernelM a = KernelM {unKernelM :: KernelCtx -> KernelState -> (Either KernelError a, KernelState)}
+newtype KernelM a = KernelM {unKernelM :: KernelCtx -> KernelState -> IO (Either KernelError a, KernelState)}
 
 instance Functor KernelM where
   fmap f (KernelM m) = KernelM $ \ctx st ->
-    case m ctx st of
-      (Right a, st') -> (Right (f a), st')
-      (Left err, st') -> (Left err, st')
+    m ctx st >>= \case
+      (Right a, st') -> pure (Right (f a), st')
+      (Left err, st') -> pure (Left err, st')
   {-# INLINE fmap #-}
 
 instance Applicative KernelM where
-  pure a = KernelM $ \_ st -> (Right a, st)
+  pure a = KernelM $ \_ st -> pure (Right a, st)
   {-# INLINE pure #-}
   KernelM mf <*> KernelM ma = KernelM $ \ctx st ->
-    case mf ctx st of
-      (Left err, st') -> (Left err, st')
-      (Right f, st') -> case ma ctx st' of
-        (Left err, st'') -> (Left err, st'')
-        (Right a, st'') -> (Right (f a), st'')
+    mf ctx st >>= \case
+      (Left err, st') -> pure (Left err, st')
+      (Right f, st') ->
+        ma ctx st' >>= \case
+          (Left err, st'') -> pure (Left err, st'')
+          (Right a, st'') -> pure (Right (f a), st'')
   {-# INLINE (<*>) #-}
 
 instance Monad KernelM where
   return = pure
   KernelM m >>= f = KernelM $ \ctx st ->
-    case m ctx st of
-      (Left err, st') -> (Left err, st')
+    m ctx st >>= \case
+      (Left err, st') -> pure (Left err, st')
       (Right a, st') -> unKernelM (f a) ctx st'
   {-# INLINE (>>=) #-}
 
 instance MonadReader KernelCtx KernelM where
-  ask = KernelM $ \ctx st -> (Right ctx, st)
+  ask = KernelM $ \ctx st -> pure (Right ctx, st)
   {-# INLINE ask #-}
   local f (KernelM m) = KernelM $ \ctx st -> m (f ctx) st
   {-# INLINE local #-}
 
 instance MonadState KernelState KernelM where
-  get = KernelM $ \_ st -> (Right st, st)
+  get = KernelM $ \_ st -> pure (Right st, st)
   {-# INLINE get #-}
-  put !newSt = KernelM $ \_ _ -> (Right (), newSt)
+  put !newSt = KernelM $ \_ _ -> pure (Right (), newSt)
   {-# INLINE put #-}
 
 instance MonadError KernelError KernelM where
-  throwError err = KernelM $ \_ st -> (Left err, st)
+  throwError err = KernelM $ \_ st -> pure (Left err, st)
   {-# INLINE throwError #-}
   catchError (KernelM m) handler = KernelM $ \ctx st ->
-    case m ctx st of
+    m ctx st >>= \case
       (Left err, st') -> unKernelM (handler err) ctx st'
-      success -> success
+      success -> pure success
   {-# INLINE catchError #-}
 
 instance MonadFail KernelM where
   fail = throwError
   {-# INLINE fail #-}
 
-instance Show (KernelM a) where
-  show _ = "<thunk>"
+instance MonadIO KernelM where
+  liftIO io = KernelM $ \_ st -> do
+    r <- io
+    pure (Right r, st)
+  {-# INLINE liftIO #-}
 
 --------------------------------------------------------------------------------
 

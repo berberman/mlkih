@@ -1,3 +1,5 @@
+{-# LANGUAGE LambdaCase #-}
+
 module Mlkih.Kernel.Monad
   ( KernelM,
     KernelCtx,
@@ -28,12 +30,18 @@ module Mlkih.Kernel.Monad
     lookupValidatedRecursorTargetInductive,
     modifyMetadata,
     modifyGlobalEnv,
+    emitProgress,
+    initialProgressState,
+    withKernelConsoleProgress,
+    runKernelMWithProgress,
   )
 where
 
+import Control.Exception (onException)
 import Control.Monad.Error.Class
 import Control.Monad.Reader.Class
 import Control.Monad.State.Strict
+import Data.IORef
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as Map
 import Mlkih.Env
@@ -44,6 +52,8 @@ import Mlkih.Kernel.Types
 import Mlkih.Level
 import Mlkih.Name
 import Mlkih.Pretty
+import System.Console.Concurrent
+import System.Console.Regions
 
 ------------------------------------------------------------
 
@@ -62,37 +72,107 @@ emptyKernelCtx :: KernelCtx
 emptyKernelCtx =
   KernelCtx
     { checkLocalCtx = IntMap.empty,
-      checkTraceConfig = defaultTraceConfig
+      checkTraceConfig = defaultTraceConfig,
+      checkProgress = \_ -> pure ()
     }
 
 emptyKernelEnv :: KernelEnv
 emptyKernelEnv = IntMap.empty
 
 -- | Runs the kernel, returning both the result and the final state
-runKernelM :: KernelEnv -> InternState -> KernelM a -> (Either KernelError a, KernelState)
+runKernelM :: KernelEnv -> InternState -> KernelM a -> IO (Either KernelError a, KernelState)
 runKernelM env internSt action = (unKernelM action) emptyKernelCtx ((emptyKernelState env) {checkInternState = internSt})
 
 -- | Evaluates the kernel, discarding the final state
-evalKernelM :: KernelEnv -> InternState -> KernelM a -> Either KernelError a
-evalKernelM env internSt action = fst $ runKernelM env internSt action
+evalKernelM :: KernelEnv -> InternState -> KernelM a -> IO (Either KernelError a)
+evalKernelM env internSt action = fst <$> runKernelM env internSt action
 
 -- | Executes the kernel, discarding the result and keeping the state
-execKernelM :: KernelEnv -> InternState -> KernelM a -> Either KernelError KernelState
-execKernelM env internSt action = case runKernelM env internSt action of
-  (Left err, _) -> Left err
-  (Right _, st) -> Right st
+execKernelM :: KernelEnv -> InternState -> KernelM a -> IO (Either KernelError KernelState)
+execKernelM env internSt action =
+  runKernelM env internSt action >>= \case
+    (Left err, _) -> pure $ Left err
+    (Right _, st) -> pure $ Right st
 
-execKernelM' :: KernelM a -> Either KernelError KernelState
+execKernelM' :: KernelM a -> IO (Either KernelError KernelState)
 execKernelM' action = execKernelM emptyKernelEnv emptyInternState action
 
 runKernelWithTraceIO :: KernelEnv -> InternState -> KernelM a -> IO (Either KernelError a, InternState)
 runKernelWithTraceIO env internSt action = do
-  let (result, finalState) = runKernelM env internSt action
+  (result, finalState) <- runKernelM env internSt action
   printKernelTrace finalState
   case result of
     Left err -> putStrLn $ "❌ Kernel Error: " ++ err
     Right _ -> putStrLn "✅ Kernel Execution Succeeded."
   pure (result, checkInternState finalState)
+
+------------------------------------------------------------
+
+initialProgressState :: ProgressState
+initialProgressState =
+  ProgressState
+    { progressDone = 0,
+      progressTotal = 0,
+      progressCurrent = Nothing
+    }
+
+emitProgress :: ProgressEvent -> KernelM ()
+emitProgress ev = do
+  sink <- asks checkProgress
+  liftIO $ sink ev
+
+withKernelConsoleProgress ::
+  ((ProgressEvent -> IO ()) -> IO a) ->
+  IO a
+withKernelConsoleProgress action =
+  displayConsoleRegions $ do
+    regionRef <- newIORef Nothing
+    action (concurrentProgressSink regionRef)
+
+runKernelMWithProgress ::
+  (ProgressEvent -> IO ()) ->
+  KernelEnv ->
+  InternState ->
+  KernelM a ->
+  IO (Either KernelError a, KernelState)
+runKernelMWithProgress progress env internState action =
+  unKernelM action (emptyKernelCtx {checkProgress = progress}) ((emptyKernelState env) {checkInternState = internState})
+
+concurrentProgressSink :: IORef (Maybe ConsoleRegion) -> ProgressEvent -> IO ()
+concurrentProgressSink regionRef ev =
+  case ev of
+    ProgressCheckingDecl i total subject -> do
+      mbOld <- readIORef regionRef
+      case mbOld of
+        Nothing -> pure ()
+        Just old -> finishConsoleRegion old ""
+      region <- openConsoleRegion Linear
+      writeIORef regionRef (Just region)
+      setConsoleRegion region $
+        renderProgressLine "Checking" i total (ppr subject)
+    ProgressCheckedDecl i total subject -> do
+      mbRegion <- readIORef regionRef
+      case mbRegion of
+        Nothing ->
+          outputConcurrent $
+            renderProgressLine "Checked " i total (ppr subject) <> "\n"
+        Just region -> do
+          finishConsoleRegion region $
+            renderProgressLine "Checked " i total (ppr subject)
+          writeIORef regionRef Nothing
+    ProgressMessage doc ->
+      outputConcurrent (toString doc <> "\n")
+
+renderProgressLine :: String -> Int -> Int -> Doc -> String
+renderProgressLine status done total subject =
+  toString $
+    ppr "["
+      <> ppr done
+      <> ppr "/"
+      <> ppr total
+      <> ppr "]"
+        <+> ppr status
+        <+> subject
 
 ------------------------------------------------------------
 

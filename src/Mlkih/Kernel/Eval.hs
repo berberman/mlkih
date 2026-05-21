@@ -26,17 +26,17 @@ import Numeric.Natural
 
 --------------------------------------------------------------------------------
 
-evalM :: LocalEnv -> HCExpr -> KernelM Value
-evalM env expr = traceBlock PhEval TkEnter TraceDetail "eval.expr" [("expr", TrExpr expr), ("envLen", TrInt (length env))] $ do
+evalM :: Int -> LocalEnv -> HCExpr -> KernelM Value
+evalM depth env expr = traceBlock PhEval TkEnter TraceDetail "eval.expr" [("depth", TrInt depth), ("expr", TrExpr expr), ("envLen", TrInt (length env))] $ do
   traceEvent PhEval TkEvent TraceDump "local.env" [("env", TrDoc (ppr env))]
   case hceVal expr of
     BVar idx -> do
-      traceEvent PhEval TkLookup TraceDetail "eval.bvar" [("index", TrInt idx)]
+      traceEvent PhEval TkLookup TraceDetail "eval.bvar" [("index", TrInt idx), ("depth", TrInt depth)]
       case env !? idx of
         Just val -> pure val
         _ -> do
-          traceFail PhEval TkLookup TraceSummary "eval.bvar.outOfBounds" [("index", TrInt idx), ("envLen", TrInt (length env))]
-          throwError $ "Local variable index out of bounds: " <> show idx
+          traceFail PhEval TkLookup TraceSummary "eval.bvar.outOfBounds" [("index", TrInt idx), ("envLen", TrInt (length env)), ("depth", TrInt depth)]
+          throwError $ "Local variable index out of bounds: " <> show idx <> ", envLen=" <> show (length env) <> ", depth=" <> show depth
     Sort lvl -> do
       traceOk PhEval TkEvent TraceDetail "eval.sort" [("level", TrLevel lvl)]
       pure $ VSort lvl
@@ -45,30 +45,30 @@ evalM env expr = traceBlock PhEval TkEnter TraceDetail "eval.expr" [("expr", TrE
       pure $ VLit lit
     Lam name ty body bi -> do
       traceEvent PhEval TkEvent TraceDetail "eval.lam.domain" [("binder", TrName name)]
-      tyVal <- evalM env ty
+      tyVal <- evalM depth env ty
       traceEvent PhEval TkEvent TraceDump "eval.lam.closure" [("envLen", TrInt (length env))]
       pure $ VLam name bi tyVal (Closure env body)
     ForallE name ty body bi -> do
       traceEvent PhEval TkEvent TraceDetail "eval.pi.domain" [("binder", TrName name)]
-      tyVal <- evalM env ty
+      tyVal <- evalM depth env ty
       traceEvent PhEval TkEvent TraceDump "eval.pi.closure" [("envLen", TrInt (length env))]
       pure $ VPi name bi tyVal (Closure env body)
     Let name _ val body _nondep -> do
       traceEvent PhEval TkEvent TraceDetail "eval.let.value" [("name", TrName name)]
-      valVal <- evalM env val
+      valVal <- evalM depth env val
       traceEvent PhEval TkEvent TraceDetail "eval.let.body" [("newEnvLen", TrInt (length env + 1))]
-      evalM (valVal : env) body
+      evalM depth (valVal : env) body
     App fn arg -> do
       traceEvent PhEval TkEvent TraceDetail "eval.app.fn" []
-      fnVal <- evalM env fn
+      fnVal <- evalM depth env fn
       traceEvent PhEval TkEvent TraceDetail "eval.app.arg" []
-      argVal <- evalM env arg
+      argVal <- evalM depth env arg
       traceEvent PhEval TkReduction TraceDetail "eval.app.apply" []
-      applyElimM (length env) fnVal (EApp argVal)
+      applyElimM depth fnVal (EApp argVal)
     Proj name idx struct -> do
       traceEvent PhEval TkEvent TraceDetail "eval.proj.struct" [("proj", TrName name), ("field", TrInt idx)]
-      structVal <- evalM env struct
-      applyElimM (length env) structVal (EProj name idx)
+      structVal <- evalM depth env struct
+      applyElimM depth structVal (EProj name idx)
     Const name levels -> do
       traceEvent PhLookup TkLookup TraceDetail "const.lookup" [("const", TrName name)]
       mInfo <- lookupConstInfo name
@@ -325,7 +325,7 @@ reduceRecursorCtor depth recName recLvls recVal recArgs ctorName ctorSpine = do
   let subst = zip (constLevelParameters (recConst recVal)) recLvls
 
   rhsExpr <- lift $ instantiateLevelParamsExpr subst (recRhs rule)
-  rhsVal <- lift $ evalM [] rhsExpr
+  rhsVal <- lift $ evalM 0 [] rhsExpr
 
   lift $
     traceEvent
@@ -410,7 +410,7 @@ reduceKForInductive depth targetInductive indVal indLvls indSpine recVal recArgs
   let subst = zip (constLevelParameters (ctorConst ctorVal)) indLvls
 
   ctorTypeExpr <- lift $ instantiateLevelParamsExpr subst (constType (ctorConst ctorVal))
-  ctorTypeVal <- lift $ evalM [] ctorTypeExpr
+  ctorTypeVal <- lift $ evalM 0 [] ctorTypeExpr
 
   ctorTyAfterParams <- lift $ foldM (instantiatePi depth) ctorTypeVal paramVals
   whnfCtorTy <- lift $ whnf depth ctorTyAfterParams
@@ -469,7 +469,7 @@ applyElimM depth val elim = traceBlock PhReduce TkReduction TraceSummary "apply.
     -- Beta reduction
     (VLam _ _ _ (Closure env body), EApp argVal) -> do
       traceProgress PhReduce TkReduction TraceDetail "beta.reduce" [("arg", TrValueHead argVal)]
-      evalM (argVal : env) body
+      evalM depth (argVal : env) body
     -- Projection reduction
     (VNeutral (HConst ctorName ctorLvls) spine, EProj structName projIdx) -> do
       let newSpine = EProj structName projIdx : spine
@@ -519,7 +519,7 @@ unfoldVDefOne depth name levels spineRev =
             TraceDump
             "defeq.vdef.unfold.bodyExpr"
             [("body", TrExpr bodyExpr)]
-          bodyVal <- evalM [] bodyExpr
+          bodyVal <- evalM 0 [] bodyExpr
           traceEvent
             PhDefEq
             TkUnfold
@@ -773,8 +773,8 @@ isDefEqValue depth val1 val2 = traceBlock PhDefEq TkCompare TraceSummary "defeq.
             let levelVal = VNeutral (HLvl n1 depth) []
             let decl = LocalDecl n1 ty1 Nothing
             withLocalDecl depth decl $ do
-              body1 <- evalM (levelVal : closureEnv clo1) (closureBody clo1)
-              body2 <- evalM (levelVal : closureEnv clo2) (closureBody clo2)
+              body1 <- evalM (depth + 1) (levelVal : closureEnv clo1) (closureBody clo1)
+              body2 <- evalM (depth + 1) (levelVal : closureEnv clo2) (closureBody clo2)
               traceEvent
                 PhDefEq
                 TkCompare
@@ -819,8 +819,8 @@ isDefEqValue depth val1 val2 = traceBlock PhDefEq TkCompare TraceSummary "defeq.
             let levelVal = VNeutral (HLvl n1 depth) []
             let decl = LocalDecl n1 ty1 Nothing
             withLocalDecl depth decl $ do
-              body1 <- evalM (levelVal : closureEnv clo1) (closureBody clo1)
-              body2 <- evalM (levelVal : closureEnv clo2) (closureBody clo2)
+              body1 <- evalM (depth + 1) (levelVal : closureEnv clo1) (closureBody clo1)
+              body2 <- evalM (depth + 1) (levelVal : closureEnv clo2) (closureBody clo2)
               traceEvent
                 PhDefEq
                 TkCompare
@@ -922,17 +922,17 @@ inferValue depth val = traceBlock PhInfer TkEnter TraceSummary "infer.value" [("
   VLit (NatVal _) -> do
     name <- withIntern $ internName $ simpleName "Nat"
     con <- mkConst name []
-    evalM [] con
+    evalM 0 [] con
   VLit (StrVal _) -> do
     name <- withIntern $ internName $ simpleName "String"
     con <- mkConst name []
-    evalM [] con
+    evalM 0 [] con
   VPi name _ dom clo -> do
     domTy <- inferValue depth dom
     let levelVal = VNeutral (HLvl name depth) []
     let decl = LocalDecl name dom Nothing
     withLocalDecl depth decl $ do
-      bodyVal <- evalM (levelVal : closureEnv clo) (closureBody clo)
+      bodyVal <- evalM (depth + 1) (levelVal : closureEnv clo) (closureBody clo)
       bodyTy <- inferValue (depth + 1) bodyVal
       case (domTy, bodyTy) of
         (VSort l1, VSort l2) -> VSort <$> (mkLevelIMax l1 l2)
@@ -941,7 +941,7 @@ inferValue depth val = traceBlock PhInfer TkEnter TraceSummary "infer.value" [("
     let levelVal = VNeutral (HLvl name depth) []
     let decl = LocalDecl name dom Nothing
     withLocalDecl depth decl $ do
-      bodyVal <- evalM (levelVal : closureEnv clo) (closureBody clo)
+      bodyVal <- evalM (depth + 1) (levelVal : closureEnv clo) (closureBody clo)
       bodyTy <- inferValue (depth + 1) bodyVal
       bodyTyExpr <- quote (depth + 1) bodyTy
       --
@@ -993,11 +993,11 @@ inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" 
   Lit (NatVal _) -> do
     name <- withIntern $ internName $ simpleName "Nat"
     con <- mkConst name []
-    evalM [] con
+    evalM 0 [] con
   Lit (StrVal _) -> do
     name <- withIntern $ internName $ simpleName "String"
     con <- mkConst name []
-    evalM [] con
+    evalM 0 [] con
   BVar idx -> do
     if idx < 0 || idx >= depth
       then throwError $ "De Bruijn index out of bounds: " ++ show idx
@@ -1012,14 +1012,14 @@ inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" 
       Just info -> do
         let subst = zip (constLevelParameters (constantInfoConst info)) levels
         instTypeExpr <- instantiateLevelParamsExpr subst (constType (constantInfoConst info))
-        evalM [] instTypeExpr
+        evalM 0 [] instTypeExpr
       Nothing -> throwError "Unknown constant"
   App fn arg -> do
     traceEvent PhInfer TkEvent TraceDetail "infer.app.fnType" []
     fnTypeVal <- inferExpr depth env fn
     (_, _, domTypeVal, clo) <- ensurePi depth fnTypeVal
     traceEvent PhInfer TkEvent TraceDetail "infer.app.arg" []
-    argVal <- evalM env arg
+    argVal <- evalM depth env arg
     argTypeVal <- inferValue depth argVal
     traceEvent PhDefEq TkCompare TraceDetail "infer.app.checkArg" [("argType", TrValueHead argTypeVal), ("domain", TrValueHead domTypeVal)]
     isArgTypeOk <- traceBlock
@@ -1050,33 +1050,35 @@ inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" 
         throwError "Argument type mismatch"
       else do
         traceOk PhInfer TkDecision TraceSummary "infer.app.ok" [("domain", TrValueHead domTypeVal)]
-        evalM (argVal : closureEnv clo) (closureBody clo)
+        evalM depth (argVal : closureEnv clo) (closureBody clo)
   Lam name dom body bi -> do
     traceEvent PhInfer TkEvent TraceDetail "infer.lam.domain" [("binder", TrName name)]
     -- Infer the type of the domain type, and ensure it's a sort
     domTypeSort <- inferExpr depth env dom
     _ <- ensureSort depth domTypeSort
     -- Evaluate the domain type
-    domTypeVal <- evalM env dom
+    domTypeVal <- evalM depth env dom
     let decl = LocalDecl name domTypeVal Nothing
     let levelVal = VNeutral (HLvl name depth) []
     traceEvent PhLocalCtx TkEnter TraceDetail "infer.lam.body" [("binder", TrName name), ("level", TrInt depth)]
-    -- Infer the body at depth + 1 (as the number of in-scope locals increases by one) with new local decl at level = depth
-    bodyTypeVal <- withLocalDecl depth decl $ inferExpr (depth + 1) (levelVal : env) body
-    -- Quote the body type to get a syntax-level expression that we can put in the closure
-    bodyTypeExpr <- quote (depth + 1) bodyTypeVal
+    bodyTypeExpr <- withLocalDecl depth decl $ do
+      -- Infer the body at depth + 1 (as the number of in-scope locals increases by one) with new local decl at level = depth
+      bodyTypeVal <- inferExpr (depth + 1) (levelVal : env) body
+      -- Quote the body type to get a syntax-level expression that we can put in the closure
+      quote (depth + 1) bodyTypeVal
     pure $ VPi name bi domTypeVal (Closure env bodyTypeExpr)
   ForallE name dom body _ -> do
     traceEvent PhInfer TkEvent TraceDetail "infer.pi.domain" [("binder", TrName name)]
     domTypeSort <- inferExpr depth env dom
     whnfDomTypeSort <- whnf depth domTypeSort
     lvl1 <- ensureSort depth whnfDomTypeSort
-    domTypeVal <- evalM env dom
+    domTypeVal <- evalM depth env dom
     let decl = LocalDecl name domTypeVal Nothing
     let levelVal = VNeutral (HLvl name depth) []
     traceEvent PhLocalCtx TkEnter TraceDetail "infer.pi.codomain" [("binder", TrName name), ("level", TrInt depth)]
-    bodyTypeVal <- withLocalDecl depth decl $ inferExpr (depth + 1) (levelVal : env) body
-    lvl2 <- ensureSort depth bodyTypeVal
+    lvl2 <- withLocalDecl depth decl $ do
+      bodyTypeVal <- inferExpr (depth + 1) (levelVal : env) body
+      ensureSort (depth + 1) bodyTypeVal
     traceEvent PhInfer TkEvent TraceDetail "infer.pi.imax" [("domainLevel", TrLevel lvl1), ("codomainLevel", TrLevel lvl2)]
     imaxLvl <- mkLevelIMax lvl1 lvl2
     pure $ VSort imaxLvl
@@ -1084,8 +1086,8 @@ inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" 
     traceEvent PhInfer TkEvent TraceDetail "infer.let.type" [("name", TrName name)]
     domTypeSort <- inferExpr depth env dom
     _ <- ensureSort depth domTypeSort
-    domTypeVal <- evalM env dom
-    valueVal <- evalM env value
+    domTypeVal <- evalM depth env dom
+    valueVal <- evalM depth env value
     valueTypeVal <- inferValue depth valueVal
     traceEvent PhDefEq TkCompare TraceDetail "infer.let.checkValue" [("valueType", TrValueHead valueTypeVal), ("annotated", TrValueHead domTypeVal)]
     isValueTypeOk <- isDefEqValue depth valueTypeVal domTypeVal
@@ -1097,7 +1099,10 @@ inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" 
         traceEvent PhInfer TkEvent TraceDetail "infer.let.body" [("name", TrName name)]
         let decl = LocalDecl name domTypeVal (if nondep then Nothing else Just valueVal)
         let levelVal = VNeutral (HLvl name depth) []
-        withLocalDecl depth decl $ inferExpr (depth + 1) (levelVal : env) body
+        withLocalDecl depth decl $ do
+          bodyTypeVal <- inferExpr (depth + 1) (levelVal : env) body
+          bodyTypeExpr <- quote (depth + 1) bodyTypeVal
+          evalM depth (valueVal : env) bodyTypeExpr
   Proj projName fieldIdx structExpr -> do
     traceEvent
       PhInfer
@@ -1111,7 +1116,7 @@ inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" 
 
     case whnfStructTy of
       VNeutral (HConst indName indLvls) indSpine -> do
-        structVal <- evalM env structExpr
+        structVal <- evalM depth env structExpr
         inferProjectionFieldTypeFromInductive
           depth
           projName
@@ -1152,7 +1157,7 @@ inferProjectionFieldTypeFromInductive depth projName fieldIdx indName indLvls in
   let subst = zip (constLevelParameters (ctorConst ctorVal)) indLvls
 
   ctorTypeExpr <- instantiateLevelParamsExpr subst (constType (ctorConst ctorVal))
-  ctorTypeVal <- evalM [] ctorTypeExpr
+  ctorTypeVal <- evalM 0 [] ctorTypeExpr
 
   paramVals <- inductiveParamValuesForward indVal indSpine
   tyAfterParams <- foldM (instantiatePi depth) ctorTypeVal paramVals
@@ -1193,7 +1198,7 @@ inferHeadType depth head =
             let c = constantInfoConst info
                 subst = zip (constLevelParameters c) lvls
             instTypeExpr <- instantiateLevelParamsExpr subst (constType c)
-            tyVal <- evalM [] instTypeExpr
+            tyVal <- evalM 0 [] instTypeExpr
             traceOk
               PhLookup
               TkLookup
@@ -1300,7 +1305,7 @@ isDefEqSpineAt depth currentTy currentVal lhs rhs =
                 ]
               pure False
             else do
-              nextTy <- evalM (a1 : closureEnv clo) (closureBody clo)
+              nextTy <- evalM depth (a1 : closureEnv clo) (closureBody clo)
               nextVal <- applyElimM depth currentVal (EApp a1)
               isDefEqSpineAt depth nextTy nextVal xs ys
         _ -> pure False
@@ -1333,7 +1338,7 @@ applyTypeElimAndVal depth (currentType, currentVal) elim = do
     -- When the term is applied to an argument, its type must be a Pi.
     -- We evaluate the Pi's closure using the argument.
     (VPi _ _ _ clo, EApp argVal) -> do
-      nextType <- evalM (argVal : closureEnv clo) (closureBody clo)
+      nextType <- evalM depth (argVal : closureEnv clo) (closureBody clo)
       bextVal <- applyElimM depth currentVal elim
       pure (nextType, bextVal)
     -- When the term is projected, its type must be the Inductive Type.
@@ -1360,7 +1365,7 @@ instantiatePi :: Int -> Value -> Value -> KernelM Value
 instantiatePi depth piVal argVal = do
   whnfVal <- whnf depth piVal
   case whnfVal of
-    VPi _ _ _ clo -> evalM (argVal : closureEnv clo) (closureBody clo)
+    VPi _ _ _ clo -> evalM depth (argVal : closureEnv clo) (closureBody clo)
     _ -> throwError "Expected Pi type in constructor"
 
 extractPiDomain :: Int -> Value -> KernelM (Value, Closure)
@@ -1435,8 +1440,8 @@ isDefEqExprCore depth env expr1 expr2 = traceBlock PhDefEq TkCompare TraceDetail
                           then pure False
                           else do
                             -- Everything matches
-                            tyVal <- evalM env ty1
-                            valVal <- evalM env v1
+                            tyVal <- evalM depth env ty1
+                            valVal <- evalM depth env v1
                             let decl = LocalDecl n1 tyVal (if nd1 then Nothing else Just valVal)
                             let levelVal = VNeutral (HLvl n1 depth) []
                             withLocalDecl depth decl $ isDefEq' (depth + 1) (levelVal : env) b1 b2
@@ -1469,7 +1474,7 @@ isDefEqExprCore depth env expr1 expr2 = traceBlock PhDefEq TkCompare TraceDetail
                 if not tyEq
                   then pure False
                   else do
-                    tyVal <- evalM env ty1
+                    tyVal <- evalM depth env ty1
                     let decl = LocalDecl n1 tyVal Nothing
                     let levelVal = VNeutral (HLvl n1 depth) []
                     withLocalDecl depth decl $ isDefEq' (depth + 1) (levelVal : env) b1 b2
@@ -1486,7 +1491,7 @@ isDefEqExprCore depth env expr1 expr2 = traceBlock PhDefEq TkCompare TraceDetail
                 if not tyEq
                   then pure False
                   else do
-                    tyVal <- evalM env ty1
+                    tyVal <- evalM depth env ty1
                     let decl = LocalDecl n1 tyVal Nothing
                     let levelVal = VNeutral (HLvl n1 depth) []
                     withLocalDecl depth decl $ isDefEq' (depth + 1) (levelVal : env) b1 b2
@@ -1497,8 +1502,8 @@ isDefEqExprCore depth env expr1 expr2 = traceBlock PhDefEq TkCompare TraceDetail
   where
     fallbackToWHNF reason = do
       traceEvent PhDefEq TkFallback TraceDetail "defeq.expr.fallback.whnf" [("reason", TrString reason)]
-      val1 <- evalM env expr1
-      val2 <- evalM env expr2
+      val1 <- evalM depth env expr1
+      val2 <- evalM depth env expr2
       isDefEqValue depth val1 val2
 
 isDefEqElim :: Int -> Elim -> Elim -> KernelM Bool
@@ -1513,8 +1518,8 @@ checkEta depth name ty clo otherVal = traceBlock PhEta TkCompare TraceDetail "et
   let levelVal = VNeutral (HLvl name depth) []
   let decl = LocalDecl name ty Nothing
   withLocalDecl depth decl $ do
-    body1 <- evalM (levelVal : closureEnv clo) (closureBody clo)
-    body2 <- applyElimM depth otherVal (EApp levelVal)
+    body1 <- evalM (depth + 1) (levelVal : closureEnv clo) (closureBody clo)
+    body2 <- applyElimM (depth + 1) otherVal (EApp levelVal)
     isDefEqValue (depth + 1) body1 body2
 
 checkStructEta :: Int -> HCName -> Spine -> Value -> KernelM Bool
@@ -1565,7 +1570,7 @@ quote depth val = traceBlock PhQuote TkEnter TraceSummary "quote.value" [("depth
       let decl = LocalDecl name ty Nothing
       let levelVal = VNeutral (HLvl name depth) []
       withLocalDecl depth decl $ do
-        bodyVal <- evalM (levelVal : closureEnv clo) (closureBody clo)
+        bodyVal <- evalM (depth + 1) (levelVal : closureEnv clo) (closureBody clo)
         bodyExpr <- quote (depth + 1) bodyVal
         mkLam name tyExpr bodyExpr bi
     VPi name bi ty clo -> do
@@ -1573,12 +1578,22 @@ quote depth val = traceBlock PhQuote TkEnter TraceSummary "quote.value" [("depth
       let decl = LocalDecl name ty Nothing
       let levelVal = VNeutral (HLvl name depth) []
       withLocalDecl depth decl $ do
-        bodyVal <- evalM (levelVal : closureEnv clo) (closureBody clo)
+        bodyVal <- evalM (depth + 1) (levelVal : closureEnv clo) (closureBody clo)
         bodyExpr <- quote (depth + 1) bodyVal
         mkForall name tyExpr bodyExpr bi
     VNeutral head spine -> do
       headExpr <- case head of
-        HLvl _ fv -> mkBVar (depth - 1 - fv)
+        HLvl n fv -> do
+          let idx = depth - 1 - fv
+          when (idx < 0) $
+            throwError $
+              "quote: escaped local level "
+                <> show fv
+                <> " at quote depth "
+                <> show depth
+                <> " for "
+                <> toString n
+          mkBVar idx
         HConst name levels -> mkConst name levels
       traceEvent PhQuote TkEvent TraceDetail "quote.neutral.head" [("head", TrHead head), ("spineLen", TrInt (length spine))]
       foldM (quoteElim depth) headExpr (reverse spine)

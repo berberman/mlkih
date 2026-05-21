@@ -23,6 +23,7 @@ common warnings
     , aeson
     , base                  ^>=4.20
     , bytestring
+    , concurrent-output
     , containers
     , mtl
     , text

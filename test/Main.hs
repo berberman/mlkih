@@ -41,17 +41,18 @@ main = do
   -- parsed <- expectRight =<< parseExportFileWithState "export.exported.ndjson"
   -- putStrLn "Parsed export file successfully, checking..."
   parsed <- loadParsedLeanFixture fooFixture
-  state <- expectRightKernel $ withTraceVerbosity TraceDump $ withFullTrace $ checkParsedExport parsed
+  state <- expectRightKernel $ withTraceConfig (defaultTraceConfig {traceOutcomes = Just [OutFail], traceVerbosity = TraceSummary}) $ checkParsedExport parsed
 
   pure ()
 
 expectRightKernel :: KernelM a -> IO KernelState
-expectRightKernel k = case runKernelM emptyKernelEnv emptyInternState k of
-  (Left err, state) -> do
-    writeFile "kernel_err_env.trace" (renderPlain $ ppr $ IntMap.elems $ checkEnv state)
-    writeFile "kernel_err_trace.trace" (renderPlain $ renderKernelTrace state)
-    failWith err
-  (Right _, state) -> pure state
+expectRightKernel k = withKernelConsoleProgress $ \progress ->
+  runKernelMWithProgress progress emptyKernelEnv emptyInternState k >>= \case
+    (Left err, state) -> do
+      writeFile "kernel_err_env.trace" (renderPlain $ ppr $ IntMap.elems $ checkEnv state)
+      writeFile "kernel_err_trace.trace" (renderPlain $ renderKernelTrace state)
+      failWith err
+    (Right _, state) -> pure state
 
 testDefEqCacheHits :: IO ()
 testDefEqCacheHits = do
@@ -106,7 +107,7 @@ testSemanticStructEtaEquivalence = do
 
   result <- runKernelExpectRight env $ do
     structExpr <- mkConst structName []
-    structTyVal <- evalM [] structExpr
+    structTyVal <- evalM 0 [] structExpr
 
     let nP = hcName ["p"]
     let vP = VNeutral (HLvl nP 0) []
@@ -290,7 +291,7 @@ withTestContext names buildTypes action = do
 
   let go [] _ env = action totalDepth env var
       go ((nameStr, tyExpr) : rest) currentDepth env = do
-        tyVal <- evalM finalEnv tyExpr
+        tyVal <- evalM currentDepth finalEnv tyExpr
         let name = hcName [nameStr]
         let decl = LocalDecl name tyVal Nothing
         withLocalDecl currentDepth decl $
@@ -371,12 +372,14 @@ testKernelChecksGeneratedNatAddSuccFixtureTheorem = do
       Just (ThmDecl thm) -> pure thm
       _ -> failWith "expected natAddSuccFixture theorem declaration"
   (lookedUp, hasBody, unfoldable) <-
-    expectRight . evalKernelM env checkedInternState $ do
-      let theoremName = constName (thmConst theoremDecl)
-      lookedUp <- lookupConstInfo theoremName
-      hasBody <- constHasBody theoremName
-      unfoldable <- constIsDeltaUnfoldable theoremName
-      pure (lookedUp, hasBody, unfoldable)
+    expectRight
+      =<< ( evalKernelM env checkedInternState $ do
+              let theoremName = constName (thmConst theoremDecl)
+              lookedUp <- lookupConstInfo theoremName
+              hasBody <- constHasBody theoremName
+              unfoldable <- constIsDeltaUnfoldable theoremName
+              pure (lookedUp, hasBody, unfoldable)
+          )
   assertEq (Just (ThmInfo theoremDecl)) lookedUp "expected sequential checker to install the generated theorem after earlier declarations succeed"
   assertEq True hasBody "expected theorem body to remain available after declaration checking"
   assertEq False unfoldable "expected checked theorem declarations to remain non-delta-unfoldable"
@@ -385,9 +388,11 @@ testKernelChecksImportedNatRecursorIotaTheorem :: IO ()
 testKernelChecksImportedNatRecursorIotaTheorem = do
   (env, checkedInternState) <- loadCheckedLeanFixture natAddSuccFixture
   lookedUp <-
-    expectRight . evalKernelM env checkedInternState $ do
-      theoremName <- withIntern $ internName (rawName ["natRecZeroFixture"])
-      lookupConstInfo theoremName
+    expectRight
+      =<< ( evalKernelM env checkedInternState $ do
+              theoremName <- withIntern $ internName (rawName ["natRecZeroFixture"])
+              lookupConstInfo theoremName
+          )
   case lookedUp of
     Just (ThmInfo _) -> pure ()
     _ -> failWith "expected public checker path to admit the imported Nat.rec zero-case iota theorem"

@@ -29,8 +29,42 @@ import Mlkih.Pretty
 
 --------------------------------------------------------------------------------
 
+declProgressUnits :: Decl HCExpr HCLevel -> Int
+declProgressUnits decl =
+  case decl of
+    InductiveBlockDecl block ->
+      length (indTypes block)
+        + length (indConstructors block)
+        + length (indRecursors block)
+    _ -> 1
+
+declProgressSubject :: Decl HCExpr HCLevel -> ProgressSubject
+declProgressSubject decl =
+  case decl of
+    InductiveBlockDecl block ->
+      ProgressInductiveBlock
+        InductiveBlockProgress
+          { ibTypes = fmap (constName . indConst) (indTypes block),
+            ibConstructorCount = length (indConstructors block),
+            ibRecursorCount = length (indRecursors block)
+          }
+    _ ->
+      ProgressConstant (constantInfoName (declToConstantInfo decl))
+
+--------------------------------------------------------------------------------
+
 addDecls :: [Decl HCExpr HCLevel] -> KernelM ()
-addDecls = mapM_ processDecl
+addDecls decls = go 1 decls
+  where
+    total = sum (map declProgressUnits decls)
+    go _ [] = pure ()
+    go i (decl : rest) = do
+      let subject = declProgressSubject decl
+          units = declProgressUnits decl
+      emitProgress $ ProgressCheckingDecl i total subject
+      processDecl decl
+      emitProgress $ ProgressCheckedDecl i total subject
+      go (i + units) rest
 
 processDecl :: Decl HCExpr HCLevel -> KernelM ()
 processDecl decl =
@@ -257,7 +291,7 @@ checkBodyIfPresent info tyExpr =
           ("body", TrExpr valExpr')
         ]
       valTypeVal <- inferExpr 0 [] valExpr'
-      expectedTyVal <- evalM [] tyExpr
+      expectedTyVal <- evalM 0 [] tyExpr
       traceEvent
         PhDefEq
         TkCompare
