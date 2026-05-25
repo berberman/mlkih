@@ -521,40 +521,54 @@ unfoldVDefOne depth name levels spineRev = do
         ("spineLen", TrInt (length spineRev))
       ]
     $ do
-      mInfo <- lookupConstInfo name
-      case mInfo of
-        Just (DefnInfo def) -> do
-          let subst = zip (constLevelParameters (defConst def)) levels
-          bodyExpr <- instantiateLevelParamsExpr subst (defValue def)
-          traceEvent
-            PhDefEq
-            TkUnfold
-            TraceDump
-            "defeq.vdef.unfold.bodyExpr"
-            [("body", TrExpr bodyExpr)]
-          bodyVal <- evalM 0 [] bodyExpr
-          traceEvent
-            PhDefEq
-            TkUnfold
+      mNative <- tryNativeNat depth name spineRev
+      case mNative of
+        Just nativeVal -> do
+          traceProgress
+            PhReduce
+            TkReduction
             TraceDetail
-            "defeq.vdef.unfold.bodyVal"
-            [("body", TrValueHead bodyVal)]
-          result <- applyElimsM depth bodyVal spineRev
-          traceEvent
-            PhDefEq
-            TkUnfold
-            TraceDetail
-            "defeq.vdef.unfold.result"
-            [("result", TrValueHead result)]
-          traceEvent
-            PhDefEq
-            TkUnfold
-            TraceDump
-            "defeq.vdef.unfold.result.full"
-            [("result", TrValue result)]
-          pure result
-        _ ->
-          throwError $ "unfoldVDefOne: VDef head is not a transparent definition: " <> toString name
+            "native.reduce"
+            [ ("const", TrName name),
+              ("spineLen", TrInt (length spineRev)),
+              ("result", TrValueHead nativeVal)
+            ]
+          pure nativeVal
+        _ -> do
+          mInfo <- lookupConstInfo name
+          case mInfo of
+            Just (DefnInfo def) -> do
+              let subst = zip (constLevelParameters (defConst def)) levels
+              bodyExpr <- instantiateLevelParamsExpr subst (defValue def)
+              traceEvent
+                PhDefEq
+                TkUnfold
+                TraceDump
+                "defeq.vdef.unfold.bodyExpr"
+                [("body", TrExpr bodyExpr)]
+              bodyVal <- evalM 0 [] bodyExpr
+              traceEvent
+                PhDefEq
+                TkUnfold
+                TraceDetail
+                "defeq.vdef.unfold.bodyVal"
+                [("body", TrValueHead bodyVal)]
+              result <- applyElimsM depth bodyVal spineRev
+              traceEvent
+                PhDefEq
+                TkUnfold
+                TraceDetail
+                "defeq.vdef.unfold.result"
+                [("result", TrValueHead result)]
+              traceEvent
+                PhDefEq
+                TkUnfold
+                TraceDump
+                "defeq.vdef.unfold.result.full"
+                [("result", TrValue result)]
+              pure result
+            _ ->
+              throwError $ "unfoldVDefOne: VDef head is not a transparent definition: " <> toString name
 
 unfoldVDefsByHint :: Int -> Value -> Value -> KernelM Bool
 unfoldVDefsByHint depth lhs rhs =
@@ -1031,6 +1045,87 @@ expandNatLitCtor n
   | otherwise = do
       succ <- withIntern $ internName $ Name (Str (simpleName "Nat") "succ")
       pure $ VNeutral (HConst succ []) [EApp (VLit (NatVal (n - 1)))]
+
+extractNatVal :: Int -> Value -> KernelM (Maybe Natural)
+extractNatVal depth =
+  go (256 :: Int)
+  where
+    go fuel val
+      | fuel <= 0 =
+          pure Nothing
+      | otherwise = do
+          w <- whnf depth val
+          case w of
+            VLit (NatVal n) ->
+              pure (Just n)
+            VNeutral (HConst name _) []
+              | nameToString name == "Nat.zero" ->
+                  pure (Just 0)
+            VNeutral (HConst name _) [EApp predVal]
+              | nameToString name == "Nat.succ" -> do
+                  mp <- go (fuel - 1) predVal
+                  pure ((+ 1) <$> mp)
+            _ ->
+              pure Nothing
+
+tryNativeNat :: Int -> HCName -> Spine -> KernelM (Maybe Value)
+tryNativeNat depth name spineRev =
+  case nameToString name of
+    "Nat.add" ->
+      nativeBinNat depth spineRev $ \x y ->
+        Just <$> pure (VLit (NatVal (x + y)))
+    "Nat.mul" ->
+      nativeBinNat depth spineRev $ \x y ->
+        Just <$> pure (VLit (NatVal (x * y)))
+    "Nat.pow" ->
+      nativeBinNat depth spineRev $ \x y ->
+        pure $ VLit . NatVal <$> safeNatPow x y
+    "Nat.sub" ->
+      nativeBinNat depth spineRev $ \x y ->
+        Just <$> pure (VLit (NatVal (if x >= y then x - y else 0)))
+    "Nat.beq" ->
+      nativeBinNatBool depth spineRev (==)
+    "Nat.ble" ->
+      nativeBinNatBool depth spineRev (<=)
+    _ -> pure Nothing
+
+nativeBinNat ::
+  Int ->
+  Spine ->
+  (Natural -> Natural -> KernelM (Maybe Value)) ->
+  KernelM (Maybe Value)
+nativeBinNat depth spineRev op =
+  case matchBinRev spineRev of
+    Nothing ->
+      pure Nothing
+    Just (xVal, yVal, extraRev) -> do
+      mX <- extractNatVal depth xVal
+      mY <- extractNatVal depth yVal
+      case (mX, mY) of
+        (Just x, Just y) -> do
+          mResult <- op x y
+          case mResult of
+            Just result ->
+              Just <$> applyElimsM depth result extraRev
+            Nothing -> pure Nothing
+        _ -> pure Nothing
+
+nativeBinNatBool ::
+  Int ->
+  Spine ->
+  (Natural -> Natural -> Bool) ->
+  KernelM (Maybe Value)
+nativeBinNatBool depth spineRev p =
+  nativeBinNat depth spineRev $ \x y -> do
+    b <- mkBoolValue (p x y)
+    pure (Just b)
+
+safeNatPow :: Natural -> Natural -> Maybe Natural
+safeNatPow x y
+  | y > 10000 =
+      Nothing
+  | otherwise =
+      Just (x ^ y)
 
 inferExpr :: Int -> LocalEnv -> HCExpr -> KernelM Value
 inferExpr depth env expr = traceBlock PhInfer TkEnter TraceSummary "infer.expr" [("depth", TrInt depth), ("expr", TrExpr expr), ("envLen", TrInt (length env))] $ case hceVal expr of
@@ -1602,8 +1697,6 @@ checkStructEta depth ctorName spine otherVal = traceBlock PhEta TkCompare TraceD
       pure False
 
 --------------------------------------------------------------------------------
-
-
 
 --------------------------------------------------------------------------------
 

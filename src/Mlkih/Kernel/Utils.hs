@@ -1,13 +1,17 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Mlkih.Kernel.Utils where
 
 import Control.Monad (when)
 import Control.Monad.Error.Class
 import Mlkih.Env
 import Mlkih.Expr
+import Mlkih.Intern
 import Mlkih.Kernel.Monad
 import Mlkih.Kernel.Trace
 import Mlkih.Kernel.Types
 import Mlkih.Level
+import Mlkih.Name
 
 --------------------------------------------------------------------------------
 
@@ -289,3 +293,19 @@ constructorFieldsForRecursor rule ctorSpineRev = do
   (fieldsRev, _) <-
     splitConstructorFieldsRev "recursor.constructorFields" fieldsN ctorSpineRev
   pure fieldsRev
+
+matchBinRev :: Spine -> Maybe (Value, Value, Spine)
+matchBinRev spineRev =
+  case spineRev of
+    EApp y : EApp x : extraRev -> Just (x, y, extraRev)
+    _ -> Nothing
+
+mkBoolValue :: Bool -> KernelM Value
+mkBoolValue b = do
+  boolName <-
+    withIntern $
+      internName $
+        Name $
+          (Str (simpleName "Bool"))
+            (if b then "true" else "false")
+  pure (VNeutral (HConst boolName []) [])
